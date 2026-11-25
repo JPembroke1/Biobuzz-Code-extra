@@ -46,6 +46,12 @@ public class Intake {
      *
      * false:
      * Digital input LOW means triggered.
+     *
+     * Set back to true on 24 Nov 2026 (suspected sensor issue). Check with
+     * Panels: with true, rawSensorState should be false with the slot empty
+     * and true with a ball present. If it's the other way round, set false.
+     * If rawSensorState never changes, the sensor is on the wrong channel
+     * of its digital port in the robot configuration (try N+1).
      */
     public static boolean sensorTriggeredWhenHigh = true;
 
@@ -87,6 +93,14 @@ public class Intake {
      */
     private boolean currentBallCounted = false;
 
+    /*
+     * Last values sent to the hardware. Commands are only sent when the
+     * value changes, which saves loop time. NaN forces the first write.
+     */
+    private double lastLeftPower = Double.NaN;
+    private double lastRightPower = Double.NaN;
+    private double lastLedCommanded = Double.NaN;
+
 
     // -------------------------------------------------------------------------
     // Initialization
@@ -105,7 +119,7 @@ public class Intake {
         );
 
         intakeMotorLeft.setDirection(
-                DcMotorSimple.Direction.REVERSE
+                DcMotorSimple.Direction.FORWARD
         );
 
         intakeMotorRight.setDirection(
@@ -141,7 +155,16 @@ public class Intake {
                 )
         );
 
-        led.setPwmEnable();
+        /*
+         * Do not call led.setPwmEnable() here. The hub rejects enabling a
+         * servo port before a position has been set
+         * (SERVO_NOT_CONFIG_BEFORE_ENABLED). setLedRed() below sets the
+         * position, and setPosition() enables the PWM output by itself.
+         */
+
+        lastLeftPower = Double.NaN;
+        lastRightPower = Double.NaN;
+        lastLedCommanded = Double.NaN;
 
         rawSensorState =
                 ballSensor.getState();
@@ -172,24 +195,28 @@ public class Intake {
             double rightPower
     ) {
 
-        intakeMotorLeft.setPower(
-                clip(leftPower, -1.0, 1.0)
-        );
-
-        intakeMotorRight.setPower(
-                clip(rightPower, -1.0, 1.0)
-        );
+        setMotorPowers(leftPower, rightPower);
     }
 
 
     public void stopIntake() {
+        setMotorPowers(0.0, 0.0);
+    }
 
-        if (intakeMotorLeft != null) {
-            intakeMotorLeft.setPower(0.0);
+
+    private void setMotorPowers(double leftPower, double rightPower) {
+
+        double left = Double.isFinite(leftPower) ? clip(leftPower, -1.0, 1.0) : 0.0;
+        double right = Double.isFinite(rightPower) ? clip(rightPower, -1.0, 1.0) : 0.0;
+
+        if (intakeMotorLeft != null && left != lastLeftPower) {
+            intakeMotorLeft.setPower(left);
+            lastLeftPower = left;
         }
 
-        if (intakeMotorRight != null) {
-            intakeMotorRight.setPower(0.0);
+        if (intakeMotorRight != null && right != lastRightPower) {
+            intakeMotorRight.setPower(right);
+            lastRightPower = right;
         }
     }
 
@@ -454,8 +481,9 @@ public class Intake {
                         1.0
                 );
 
-        if (led != null) {
+        if (led != null && clippedPosition != lastLedCommanded) {
             led.setPosition(clippedPosition);
+            lastLedCommanded = clippedPosition;
         }
 
         lastLedPosition =

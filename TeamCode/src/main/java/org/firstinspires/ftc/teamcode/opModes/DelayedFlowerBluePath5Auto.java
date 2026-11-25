@@ -428,7 +428,7 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
 
         turret.setFixedServoPosition(activeTurretPosition);
         intake.update();
-        outtake.setHoodPosition(RobotConstants.HOOD_POSITION);
+        outtake.setHoodPosition(RobotConstants.hoodPosition);
         outtake.update();
 
         // Throttled: building and sending ~60 telemetry lines every loop skews loop timing.
@@ -495,11 +495,11 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
 
     private void holdFlowerCollection() {
         robotSettings.block();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerDropPos);
         intake.intake(
-                RobotConstants.FRONT_INTAKE_SPEED,
-                RobotConstants.BACK_INTAKE_SPEED
+                RobotConstants.frontIntakeSpeed,
+                RobotConstants.backIntakeSpeed
         );
     }
 
@@ -561,7 +561,7 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
     private void beginShot(double turretPosition, double feedSeconds) {
         shotCount++;
         setFixedTurretPosition(turretPosition);
-        outtake.setTargetTPS(RobotConstants.OUTTAKE_TPS);
+        outtake.setTargetTPS(RobotConstants.outtakeTps);
         startShooterReadyWait();
         stopIntakeAndBlock();
         shootStartTime = getRuntime();
@@ -608,7 +608,7 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
                 break;
             case RELEASE:
                 intake.stopIntake();
-                outtake.setFeederTPS(0.0);
+                outtake.stopFeeder();
                 robotSettings.release();
                 break;
             case FEED:
@@ -622,22 +622,22 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
 
     private void holdShooterAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
     private void runShootFeed() {
         robotSettings.release();
         intake.intake(
-                RobotConstants.FRONT_FEED_SPEED,
-                RobotConstants.BACK_FEED_SPEED
+                RobotConstants.frontFeedSpeed,
+                RobotConstants.backFeedSpeed
         );
-        outtake.setFeederTPS(RobotConstants.FEEDER_TPS);
+        outtake.setFeederOn(true);
     }
 
     private void stopIntakeAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
@@ -685,7 +685,7 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
     private void finishAutoMechanisms() {
         stopIntakeAndBlock();
         outtake.setTargetTPS(0.0);
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         setTravelTurretPosition();
     }
@@ -799,12 +799,8 @@ public class DelayedFlowerBluePath5Auto extends OpMode {
         );
         telemetry.addData("Shooter Ready", isShooterAtSpeed());
         telemetry.addData("Ready Timeout", shooterReadyTimeoutFired);
-        telemetry.addData(
-                "Feeder TPS",
-                "%.0f / %.0f",
-                outtake.getFeederCurrentTPS(),
-                outtake.getFeederTargetTPS()
-        );
+        // Feeder is open loop now (no encoder), so show its power, not TPS
+        telemetry.addData("Feeder Power", "%.2f", outtake.getFeederCommandedPower());
         telemetry.addData("Hood Base", "%.3f", outtake.getHoodBase());
         telemetry.addData("Hood Compensation", "%.4f", outtake.getHoodCompensation());
         telemetry.addData("Hood Command", "%.3f", outtake.getHoodPosition());

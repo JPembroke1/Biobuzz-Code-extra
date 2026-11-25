@@ -18,6 +18,22 @@ import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
 
 public class Constants {
 
+    /*
+     * Which localizer the Follower uses (every auto and the TeleOp go
+     * through create(), so this switches the whole robot).
+     *   true  = BBR Digital Expander (settings are in BBRExpanderLocalizer)
+     *   false = goBILDA Pinpoint (localizerConfig below), the old setup
+     */
+    public static boolean useExpanderLocalizer = true;
+
+    /*
+     * The expander localizer created by the last create() call, or null when
+     * the Pinpoint is in use. The TeleOp uses it to check the expander's
+     * data is fresh (odometry fault detection).
+     */
+    public static BBRExpanderLocalizer expanderLocalizer = null;
+
+    // Pinpoint settings: kept so useExpanderLocalizer = false still works.
     public static PinpointConfig localizerConfig = new PinpointConfig(c -> {
         c.name.set("pinpoint");
         c.podType.set(GoBildaPinpointDriver.GoBildaOdometryPods.goBILDA_4_BAR_POD);
@@ -67,7 +83,18 @@ public class Constants {
     );
 
     public static Follower create(HardwareMap h) {
-        //return new Follower(Drivetrain, Localizer, Foresight);
+        //return new Follower(Localizer, Drivetrain, Foresight);
+        if (useExpanderLocalizer) {
+            // Calibrates the expander's gyro: the robot must be still in INIT
+            expanderLocalizer = new BBRExpanderLocalizer(h);
+            return new Follower(
+                    expanderLocalizer,
+                    new Mecanum(h, drivetrainConfig),
+                    new Foresight(foresightConfig)
+            );
+        }
+
+        expanderLocalizer = null;
         return new Follower(
                 new PinpointLocalizer(h, localizerConfig),
                 new Mecanum(h, drivetrainConfig),

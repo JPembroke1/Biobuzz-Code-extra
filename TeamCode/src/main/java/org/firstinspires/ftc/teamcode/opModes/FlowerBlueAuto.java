@@ -388,7 +388,7 @@ public class FlowerBlueAuto extends OpMode {
         Pose currentPose = follower.pose();
         if (currentPose != null) PoseStorage.setPose(currentPose);
 
-        telemetry.addLine("===== FLOWER RED AUTO, FAST =====");
+        telemetry.addLine("===== FLOWER BLUE AUTO, FAST =====");
         telemetry.addData("Start Pose", start);
         telemetry.addData("Flower Approach Speed", "%.2f", FLOWER_APPROACH_SPEED);
         telemetry.addData("Flower Collect Speed", "%.2f", FLOWER_COLLECT_SPEED);
@@ -428,7 +428,7 @@ public class FlowerBlueAuto extends OpMode {
 
         turret.setFixedServoPosition(activeTurretPosition);
         intake.update();
-        outtake.setHoodPosition(RobotConstants.HOOD_POSITION);
+        outtake.setHoodPosition(RobotConstants.hoodPosition);
         outtake.update();
 
         // Throttled: building and sending ~60 telemetry lines every loop skews loop timing.
@@ -495,11 +495,11 @@ public class FlowerBlueAuto extends OpMode {
 
     private void holdFlowerCollection() {
         robotSettings.block();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerDropPos);
         intake.intake(
-                RobotConstants.FRONT_INTAKE_SPEED,
-                RobotConstants.BACK_INTAKE_SPEED
+                RobotConstants.frontIntakeSpeed,
+                RobotConstants.backIntakeSpeed
         );
     }
 
@@ -561,7 +561,7 @@ public class FlowerBlueAuto extends OpMode {
     private void beginShot(double turretPosition, double feedSeconds) {
         shotCount++;
         setFixedTurretPosition(turretPosition);
-        outtake.setTargetTPS(RobotConstants.OUTTAKE_TPS);
+        outtake.setTargetTPS(RobotConstants.outtakeTps);
         startShooterReadyWait();
         stopIntakeAndBlock();
         shootStartTime = getRuntime();
@@ -608,7 +608,7 @@ public class FlowerBlueAuto extends OpMode {
                 break;
             case RELEASE:
                 intake.stopIntake();
-                outtake.setFeederTPS(0.0);
+                outtake.stopFeeder();
                 robotSettings.release();
                 break;
             case FEED:
@@ -622,22 +622,22 @@ public class FlowerBlueAuto extends OpMode {
 
     private void holdShooterAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
     private void runShootFeed() {
         robotSettings.release();
         intake.intake(
-                RobotConstants.FRONT_FEED_SPEED,
-                RobotConstants.BACK_FEED_SPEED
+                RobotConstants.frontFeedSpeed,
+                RobotConstants.backFeedSpeed
         );
-        outtake.setFeederTPS(RobotConstants.FEEDER_TPS);
+        outtake.setFeederOn(true);
     }
 
     private void stopIntakeAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
@@ -685,7 +685,7 @@ public class FlowerBlueAuto extends OpMode {
     private void finishAutoMechanisms() {
         stopIntakeAndBlock();
         outtake.setTargetTPS(0.0);
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         setTravelTurretPosition();
     }
@@ -737,7 +737,7 @@ public class FlowerBlueAuto extends OpMode {
     }
 
     private void displayTelemetry(Pose currentPose) {
-        telemetry.addLine("===== FLOWER RED AUTO, FAST =====");
+        telemetry.addLine("===== FLOWER BLUE AUTO, FAST =====");
 
         if (currentPose != null) {
             telemetry.addData(
@@ -799,12 +799,8 @@ public class FlowerBlueAuto extends OpMode {
         );
         telemetry.addData("Shooter Ready", isShooterAtSpeed());
         telemetry.addData("Ready Timeout", shooterReadyTimeoutFired);
-        telemetry.addData(
-                "Feeder TPS",
-                "%.0f / %.0f",
-                outtake.getFeederCurrentTPS(),
-                outtake.getFeederTargetTPS()
-        );
+        // Feeder is open loop now (no encoder), so show its power, not TPS
+        telemetry.addData("Feeder Power", "%.2f", outtake.getFeederCommandedPower());
         telemetry.addData("Hood Base", "%.3f", outtake.getHoodBase());
         telemetry.addData("Hood Compensation", "%.4f", outtake.getHoodCompensation());
         telemetry.addData("Hood Command", "%.3f", outtake.getHoodPosition());

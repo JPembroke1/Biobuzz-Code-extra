@@ -9,79 +9,92 @@ public class RobotConstants {
     // Intake
     // -------------------------------------------------------------------------
 
-    public static double FRONT_INTAKE_SPEED = 0.9;
-    public static double BACK_INTAKE_SPEED = 0.5;
+    public static double frontIntakeSpeed = 0.9;
+    public static double backIntakeSpeed = 0.5;
 
-    public static double FRONT_FEED_SPEED = 1.0;
-    public static double BACK_FEED_SPEED = 1.0;
+    public static double frontFeedSpeed = 1.0;
+    public static double backFeedSpeed = 1.0;
 
 
     // -------------------------------------------------------------------------
     // Turret
     // -------------------------------------------------------------------------
 
-    public static double TURRET_POSITION = 0.5;
+    public static double turretPosition = 0.5;
 
 
     // -------------------------------------------------------------------------
     // Drivetrain
     // -------------------------------------------------------------------------
 
-    public static double DRIVE_SPEED = 1.0;
+    public static double driveSpeed = 1.0;
 
 
     // -------------------------------------------------------------------------
     // Shooter
+    //
+    // outtakeTps is the base fixed speed. In TeleOp, G2 bumpers add a +/-20
+    // offset on top of it for that match only; the offset resets to 0 each
+    // time TeleOp starts, and G2 D-pad left clears it.
     // -------------------------------------------------------------------------
 
-    public static double OUTTAKE_TPS = 1950.0;
+    public static double outtakeTps = 1950.0;
+    public static double outtakeTpsStep = 20.0;
 
 
     // -------------------------------------------------------------------------
     // Hood
     // -------------------------------------------------------------------------
 
-    public static double HOOD_POSITION = 0.60;
+    public static double hoodPosition = 0.40;
 
 
     // -------------------------------------------------------------------------
-    // Feeder
+    // Feeding
+    //
+    // Feeder strength is Outtake.feederPower (on/off motor, no encoder).
+    // Gate delay is CombinedTeleOp.gateOpenDelayS.
+    //
+    // feedSpeedToleranceTps: shooter must be within this of its target to
+    // START a burst. Only checked at burst start now, so it can be tighter
+    // than before for a more consistent first shot.
     // -------------------------------------------------------------------------
 
-    public static double FEEDER_TPS = 2800.0;
+    public static boolean feedRequiresSpeed = true;
 
-    public static boolean FEED_REQUIRES_SPEED = true;
-
-    public static double FEED_SPEED_TOLERANCE_TPS = 95.0;
+    public static double feedSpeedToleranceTps = 95.0;
 
 
     // -------------------------------------------------------------------------
     // Field and HIVE geometry
     //
     // Pedro coordinates are in inches.
-    // Field centre = (72, 72).
+    //
+    // NOTE: CombinedTeleOp has its own FIELD_SIZE_IN = 141.5 and
+    // ROBOT_LENGTH_MM = 380 and does not use these. Measure the robot and
+    // keep one set of values.
     // -------------------------------------------------------------------------
 
-    public static double FIELD_SIZE_IN = 144.0;
-    public static double FIELD_CENTER = 72.0;
+    public static double fieldSizeIn = 144.0;
+    public static double fieldCenter = 72.0;
 
-    public static double HIVE_Y_OFFSET = 12.75;
+    public static double hiveYOffset = 12.75;
 
-    public static double CELL_X_OFFSET = 24.0;
+    public static double cellXOffset = 24.0;
 
     // true = blue HIVE is on the lower-Y side.
-    public static boolean BLUE_IS_LOW_Y = true;
+    public static boolean blueIsLowY = true;
 
 
     // -------------------------------------------------------------------------
     // Relocalising against a wall
     // -------------------------------------------------------------------------
 
-    public static double ROBOT_LENGTH_MM = 320.0;
+    public static double robotLengthMm = 320.0;
 
     // true = robot back against wall
     // false = robot front against wall
-    public static boolean RESET_BACK_AGAINST_WALL = false;
+    public static boolean resetBackAgainstWall = false;
 
 
     // -------------------------------------------------------------------------
@@ -93,24 +106,9 @@ public class RobotConstants {
 
 
     // -------------------------------------------------------------------------
-    // Feed timing
-    // -------------------------------------------------------------------------
-
-    public static double timer = 0.0;
-    public static double delayAmount = 1;
-
-
-    // -------------------------------------------------------------------------
     // Flowers
     // -------------------------------------------------------------------------
 
     public static double flowerLiftPos = 0.0;
     public static double flowerDropPos = 0.39;
-
-
-    // -------------------------------------------------------------------------
-    // Toggle state
-    // -------------------------------------------------------------------------
-
-    public static boolean lastToggle = false;
 }

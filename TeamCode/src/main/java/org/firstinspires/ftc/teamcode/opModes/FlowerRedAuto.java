@@ -49,8 +49,8 @@ public class FlowerRedAuto extends OpMode {
 
     // Route / mechanism values unchanged from the supplied auto unless marked CHANGED.
     public static double PRELOAD_TURRET_POSITION = 0.0;
-    public static double FAR_WALL_TURRET_POSITION = 0.30;
-    public static double SECOND_FLOWER_TURRET_POSITION = 0.40;
+    public static double FAR_WALL_TURRET_POSITION = 0.40;
+    public static double SECOND_FLOWER_TURRET_POSITION = 0.45;
     public static double TRAVEL_TURRET_POSITION = 0.50;
     public static double AUTO_TURRET_TRIM = 0.0;
 
@@ -63,7 +63,7 @@ public class FlowerRedAuto extends OpMode {
     public static double PARK_SPEED = 1.00;
 
     public static double TURRET_SETTLE_SECONDS = 0.20;
-    public static double SHOOT_READY_TIMEOUT_SECONDS = 0.70;
+    public static double SHOOT_READY_TIMEOUT_SECONDS = 1.0;
     public static double BLOCK_RELEASE_SECONDS = 0.40;
     public static double PRELOAD_FEED_SECONDS = 1.00;
     public static double FLOWER_FEED_SECONDS = 1.60;
@@ -148,10 +148,10 @@ public class FlowerRedAuto extends OpMode {
     private final Pose path1End = poseFactory.of(22.4811, 50.4390, 180.0);
     private final Pose point2Start = poseFactory.of(22.4811, 47.4390, 180.0);
     private final Pose point2 = poseFactory.of(11.0, 47.9688, 170.0);
-    private final Pose point3 = poseFactory.of(22.3555, 50.1482, -178.9251);
-    private final Pose point4Start = poseFactory.of(22.3555, 50.1482, 180.0);
-    private final Pose point4 = poseFactory.of(22.6871, 94.7054, 90.0);
-    private final Pose point5Start = poseFactory.of(22.6871, 94.7054, 90.0);
+    private final Pose point3 = poseFactory.of(32.3555, 50.1482, -178.9251);
+    private final Pose point4Start = poseFactory.of(32.3555, 50.1482, 180.0);
+    private final Pose point4 = poseFactory.of(32.6871, 94.7054, 90.0);
+    private final Pose point5Start = poseFactory.of(32.6871, 94.7054, 90.0);
     private final Pose point5 = poseFactory.of(23.7064, 130.1432, 90.0);
     private final Pose point6Start = poseFactory.of(23.7064, 130.1432, 90.0);
     private final Pose point6 = poseFactory.of(42.0, 104.1657, 90.0);
@@ -428,7 +428,7 @@ public class FlowerRedAuto extends OpMode {
 
         turret.setFixedServoPosition(activeTurretPosition);
         intake.update();
-        outtake.setHoodPosition(RobotConstants.HOOD_POSITION);
+        outtake.setHoodPosition(RobotConstants.hoodPosition);
         outtake.update();
 
         // Throttled: building and sending ~60 telemetry lines every loop skews loop timing.
@@ -495,11 +495,11 @@ public class FlowerRedAuto extends OpMode {
 
     private void holdFlowerCollection() {
         robotSettings.block();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerDropPos);
         intake.intake(
-                RobotConstants.FRONT_INTAKE_SPEED,
-                RobotConstants.BACK_INTAKE_SPEED
+                RobotConstants.frontIntakeSpeed,
+                RobotConstants.backIntakeSpeed
         );
     }
 
@@ -561,7 +561,7 @@ public class FlowerRedAuto extends OpMode {
     private void beginShot(double turretPosition, double feedSeconds) {
         shotCount++;
         setFixedTurretPosition(turretPosition);
-        outtake.setTargetTPS(RobotConstants.OUTTAKE_TPS);
+        outtake.setTargetTPS(RobotConstants.outtakeTps);
         startShooterReadyWait();
         stopIntakeAndBlock();
         shootStartTime = getRuntime();
@@ -608,7 +608,7 @@ public class FlowerRedAuto extends OpMode {
                 break;
             case RELEASE:
                 intake.stopIntake();
-                outtake.setFeederTPS(0.0);
+                outtake.stopFeeder();
                 robotSettings.release();
                 break;
             case FEED:
@@ -622,22 +622,22 @@ public class FlowerRedAuto extends OpMode {
 
     private void holdShooterAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
     private void runShootFeed() {
         robotSettings.release();
         intake.intake(
-                RobotConstants.FRONT_FEED_SPEED,
-                RobotConstants.BACK_FEED_SPEED
+                RobotConstants.frontFeedSpeed,
+                RobotConstants.backFeedSpeed
         );
-        outtake.setFeederTPS(RobotConstants.FEEDER_TPS);
+        outtake.setFeederOn(true);
     }
 
     private void stopIntakeAndBlock() {
         intake.stopIntake();
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         robotSettings.block();
     }
 
@@ -685,7 +685,7 @@ public class FlowerRedAuto extends OpMode {
     private void finishAutoMechanisms() {
         stopIntakeAndBlock();
         outtake.setTargetTPS(0.0);
-        outtake.setFeederTPS(0.0);
+        outtake.stopFeeder();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         setTravelTurretPosition();
     }
@@ -799,12 +799,8 @@ public class FlowerRedAuto extends OpMode {
         );
         telemetry.addData("Shooter Ready", isShooterAtSpeed());
         telemetry.addData("Ready Timeout", shooterReadyTimeoutFired);
-        telemetry.addData(
-                "Feeder TPS",
-                "%.0f / %.0f",
-                outtake.getFeederCurrentTPS(),
-                outtake.getFeederTargetTPS()
-        );
+        // Feeder is open loop now (no encoder), so show its power, not TPS
+        telemetry.addData("Feeder Power", "%.2f", outtake.getFeederCommandedPower());
         telemetry.addData("Hood Base", "%.3f", outtake.getHoodBase());
         telemetry.addData("Hood Compensation", "%.4f", outtake.getHoodCompensation());
         telemetry.addData("Hood Command", "%.3f", outtake.getHoodPosition());

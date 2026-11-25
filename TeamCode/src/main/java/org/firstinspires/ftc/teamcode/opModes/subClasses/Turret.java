@@ -6,10 +6,12 @@ import com.qualcomm.robotcore.hardware.HardwareMap;
 import com.qualcomm.robotcore.hardware.Servo;
 
 /**
- * Pinpoint/Pedro-only turret aiming.
+ * Turret aiming: odometry for the coarse aim, Limelight for the final lock.
  *
  * The turret angle is calculated from the robot pose and the goal
- * coordinates. There is no camera involvement.
+ * coordinates. When the Limelight (mounted on the turret, on the pivot)
+ * can see the goal cluster, its bearing corrects that aim, so odometry
+ * drift after a hit doesn't move the shots. See "Vision correction" below.
  *
  * Aim chain:
  *
@@ -70,10 +72,12 @@ public class Turret {
     // ---------------------------------------------------------------------
     // Automatic aiming
     //
+    // 90 = the full servo range (+/-90 degrees, servo 0.0 to 1.0).
+    // This is the maximum: it is capped at SERVO_RANGE_DEG / 2.
     // Fixed servo commands retain the full 0.0 to 1.0 range.
     // ---------------------------------------------------------------------
 
-    public static double AUTO_AIM_MAX_ANGLE_DEG = 75.0;
+    public static double AUTO_AIM_MAX_ANGLE_DEG = 90.0;
 
     /*
      * AIM_OFFSET is a servo-position offset, not degrees.
@@ -82,6 +86,14 @@ public class Turret {
      */
     public static double AIM_OFFSET = 0.0;
     public static double AIM_GAIN = 1.0;
+
+    /*
+     * Auto-aim only sends a new servo position when it differs from the
+     * last one sent by at least this much. 0.002 is about 0.36 degrees.
+     * Saves loop time and stops jitter from pose noise. Keep 0.001-0.003;
+     * above 0.005 starts to cost accuracy. 0 = send every loop.
+     */
+    public static double servoDeadband = 0.002;
 
     /*
      * At servo centre, the turret points behind the robot.
@@ -117,6 +129,53 @@ public class Turret {
 
     public static boolean velocityCompensationActive = false;
     public static double VELOCITY_LEAD_GAIN = 0.3;
+
+    // ---------------------------------------------------------------------
+    // Vision correction (Limelight on the turret)
+    //
+    // The camera turns with the turret, so the cluster's bearing is the aim
+    // error itself. Each new frame, while the turret is settled:
+    //
+    //   angle vision wants = commanded angle + bearing + cameraYawOffsetDeg
+    //   correction         = angle vision wants - angle odometry wants
+    //
+    // The correction is smoothed and added on top of the odometry aim, so:
+    //   - the turret still swings onto the goal from odometry when no tags
+    //     are in view;
+    //   - heading drift after a hit is cancelled while tags are visible;
+    //   - when tags are lost the correction is held for visionHoldMs, then
+    //     fades out over visionFadeMs;
+    //   - a pose reset clears it (realignToSelectedGoal()).
+    //
+    // ASSUMES the cluster the camera tracks sits at the aim point. If the
+    // camera locks on but shots go consistently left/right, use
+    // cameraYawOffsetDeg (+ = aim further left).
+    // ---------------------------------------------------------------------
+
+    public static boolean visionAimEnabled = true;
+
+    /** Camera mounting / cluster trim, degrees. + = aim further left. */
+    public static double cameraYawOffsetDeg = 0.0;
+
+    /** Fraction of each new frame's error applied (0-1). Lower = smoother. */
+    public static double visionCorrectionGain = 0.5;
+
+    /** Ignore frames that disagree with odometry by more than this (wrong tag, bad frame). */
+    public static double visionMaxCorrectionDeg = 15.0;
+
+    /** Turret must have been still (within visionSettleDeg) this long before a frame counts. */
+    public static double visionSettleMs = 120.0;
+    public static double visionSettleDeg = 1.0;
+
+    /** Keep the correction this long after tags are lost, then fade it out. */
+    public static double visionHoldMs = 3000.0;
+    public static double visionFadeMs = 2000.0;
+
+    /** Vision-only mode (odometry offline): fraction of the bearing applied per frame. */
+    public static double visionOnlyGain = 0.7;
+
+    /** Vision-only mode: on target when the last bearing was within this. */
+    public static double visionOnTargetDeg = 2.0;
 
     // ---------------------------------------------------------------------
     // Goal coordinates (field frame, inches)
@@ -186,10 +245,32 @@ public class Turret {
     public enum AimSource {
         NONE,
         PINPOINT,
+        PINPOINT_VISION,
+        VISION_ONLY,
         FIXED
     }
 
     private AimSource currentAimSource = AimSource.NONE;
+
+    // Last position actually sent to the servo. NaN forces the first write.
+    private double lastCommandedServo = Double.NaN;
+
+    // Vision state
+    private boolean visionSeen = false;
+    private double visionBearingDeg = Double.NaN;
+    private long visionFrameId = -1L;
+    private long lastUsedVisionFrameId = -1L;
+    private long lastVisionSeenNs = 0L;
+
+    private double visionCorrectionDeg = 0.0;
+    private boolean visionCorrectionValid = false;
+    private long lastVisionCorrectionNs = 0L;
+
+    private boolean visionOnlyMode = false;
+
+    // Turret settle tracking (commanded angle)
+    private double settleRefAngleDeg = Double.NaN;
+    private long settleSinceNs = 0L;
 
     // ---------------------------------------------------------------------
     // Diagnostics
@@ -244,6 +325,12 @@ public class Turret {
      */
     public static boolean lastTargetMissing = false;
 
+    /** Vision diagnostics. */
+    public static double lastVisionBearingDeg = Double.NaN;
+    public static double lastVisionCorrectionDeg = 0.0;
+    public static double lastVisionMeasuredDeg = Double.NaN;
+    public static String lastVisionStatus = "NO DATA";
+
     // ---------------------------------------------------------------------
     // Initialization
     // ---------------------------------------------------------------------
@@ -259,6 +346,8 @@ public class Turret {
         turretServo.setDirection(
                 Servo.Direction.FORWARD
         );
+
+        lastCommandedServo = Double.NaN;
 
         selectedGoal = Goal.CUSTOM;
         targetPose = null;
@@ -528,11 +617,13 @@ public class Turret {
 
         selectAllianceGoal();
         clearAimDiagnostics();
+        clearVisionCorrection();
     }
 
     public void realignToSelectedGoal() {
 
         clearAimDiagnostics();
+        clearVisionCorrection();
     }
 
     private void clearAimDiagnostics() {
@@ -588,8 +679,18 @@ public class Turret {
             return;
         }
 
+        visionOnlyMode = false;
+
+        double correctionRad =
+                Math.toRadians(
+                        updateVisionCorrection(
+                                calculation.requestedAngleRad
+                        )
+                );
+
         applyAutomaticAngle(
-                calculation.requestedAngleRad
+                calculation.requestedAngleRad,
+                correctionRad
         );
 
         updateDiagnostics(
@@ -754,7 +855,8 @@ public class Turret {
     // ---------------------------------------------------------------------
 
     private void applyAutomaticAngle(
-            double requestedAngleRad
+            double requestedAngleRad,
+            double visionCorrectionRad
     ) {
 
         if (turretServo == null
@@ -769,7 +871,10 @@ public class Turret {
 
         double gainedAngle =
                 requestedAngleRad
-                        * AIM_GAIN;
+                        * AIM_GAIN
+                        + (Double.isFinite(visionCorrectionRad)
+                        ? visionCorrectionRad
+                        : 0.0);
 
         if (!Double.isFinite(gainedAngle)) {
 
@@ -830,20 +935,35 @@ public class Turret {
                         servoPosition
                 );
 
-        turretServo.setPosition(
-                servoPosition
-        );
+        double deadband =
+                Double.isFinite(servoDeadband)
+                        ? Math.abs(servoDeadband)
+                        : 0.0;
+
+        if (Double.isNaN(lastCommandedServo)
+                || Math.abs(servoPosition - lastCommandedServo) >= deadband) {
+
+            turretServo.setPosition(
+                    servoPosition
+            );
+
+            lastCommandedServo = servoPosition;
+        }
 
         lastFinalAngleDeg =
                 Math.toDegrees(
                         commandedAngle
                 );
 
+        trackSettle(lastFinalAngleDeg);
+
         lastServoPosition =
-                servoPosition;
+                lastCommandedServo;
 
         currentAimSource =
-                AimSource.PINPOINT;
+                visionCorrectionRad != 0.0
+                        ? AimSource.PINPOINT_VISION
+                        : AimSource.PINPOINT;
 
         lastAimSource =
                 currentAimSource.name();
@@ -925,13 +1045,15 @@ public class Turret {
      */
     public boolean isAimReady() {
 
-        return currentAimSource == AimSource.PINPOINT
+        return (currentAimSource == AimSource.PINPOINT
+                || currentAimSource == AimSource.PINPOINT_VISION)
                 && isTargetReachable();
     }
 
     public boolean isUsingPinpointAim() {
 
-        return currentAimSource == AimSource.PINPOINT;
+        return currentAimSource == AimSource.PINPOINT
+                || currentAimSource == AimSource.PINPOINT_VISION;
     }
 
     public AimSource getAimSource() {
@@ -951,7 +1073,7 @@ public class Turret {
                 AUTO_AIM_MAX_ANGLE_DEG
         )) {
 
-            return 75.0;
+            return 90.0;
         }
 
         return clamp(
@@ -991,17 +1113,26 @@ public class Turret {
                         position
                 );
 
-        turretServo.setPosition(
-                clippedPosition
-        );
+        // Fixed positions skip the deadband but don't resend an identical value
+        if (clippedPosition != lastCommandedServo) {
+
+            turretServo.setPosition(
+                    clippedPosition
+            );
+
+            lastCommandedServo = clippedPosition;
+        }
 
         lastFixedPositionMode = true;
         lastServoPosition = clippedPosition;
+        visionOnlyMode = false;
 
         lastFinalAngleDeg =
                 servoPositionToAngleDeg(
                         clippedPosition
                 );
+
+        trackSettle(lastFinalAngleDeg);
 
         lastTargetReachable = false;
         lastHoldingBehind = false;
@@ -1185,6 +1316,276 @@ public class Turret {
     }
 
     // ---------------------------------------------------------------------
+    // Vision input
+    // ---------------------------------------------------------------------
+
+    /**
+     * Call once per loop BEFORE aimTurret()/aimVisionOnly().
+     *
+     * @param seen       true if the goal cluster is visible this loop
+     * @param bearingDeg its bearing from the camera, degrees, + = LEFT
+     * @param frameId    the camera frame it came from (only new frames count)
+     */
+    public void setVisionMeasurement(boolean seen, double bearingDeg, long frameId) {
+
+        visionSeen = seen && Double.isFinite(bearingDeg);
+        visionBearingDeg = visionSeen ? bearingDeg : Double.NaN;
+        visionFrameId = frameId;
+
+        if (visionSeen) {
+            lastVisionSeenNs = System.nanoTime();
+        }
+
+        lastVisionBearingDeg = visionBearingDeg;
+    }
+
+    public void clearVisionMeasurement() {
+
+        setVisionMeasurement(false, Double.NaN, visionFrameId);
+    }
+
+    /** Drops the vision correction (pose reset, goal change). */
+    public void clearVisionCorrection() {
+
+        visionCorrectionDeg = 0.0;
+        visionCorrectionValid = false;
+        lastVisionCorrectionNs = 0L;
+        lastUsedVisionFrameId = -1L;
+
+        lastVisionCorrectionDeg = 0.0;
+        lastVisionMeasuredDeg = Double.NaN;
+    }
+
+    /** True if the camera can currently see the goal cluster. */
+    public boolean isVisionTargetVisible() {
+
+        return visionSeen;
+    }
+
+    /** True if a vision correction is currently being applied. */
+    public boolean isVisionCorrecting() {
+
+        return visionCorrectionValid
+                && Math.abs(lastVisionCorrectionDeg) > 1e-6;
+    }
+
+    /**
+     * Updates the smoothed correction from a new, settled frame and returns
+     * the correction to apply now (degrees), including hold and fade.
+     */
+    private double updateVisionCorrection(double requestedAngleRad) {
+
+        if (!visionAimEnabled) {
+            lastVisionStatus = "OFF";
+            lastVisionCorrectionDeg = 0.0;
+            return 0.0;
+        }
+
+        long now = System.nanoTime();
+
+        if (visionSeen
+                && visionFrameId != lastUsedVisionFrameId) {
+
+            if (!isTurretSettled()) {
+
+                lastVisionStatus = "WAITING FOR TURRET TO SETTLE";
+
+            } else {
+
+                lastUsedVisionFrameId = visionFrameId;
+
+                double odometryDeg =
+                        Math.toDegrees(requestedAngleRad * AIM_GAIN);
+
+                double visionWantsDeg =
+                        lastFinalAngleDeg
+                                + visionBearingDeg
+                                + finiteOr(cameraYawOffsetDeg, 0.0);
+
+                double measured =
+                        normalizeDegrees180(visionWantsDeg - odometryDeg);
+
+                lastVisionMeasuredDeg = measured;
+
+                if (Math.abs(measured)
+                        > Math.abs(finiteOr(visionMaxCorrectionDeg, 15.0))) {
+
+                    lastVisionStatus = String.format(
+                            "REJECTED %.1f deg (> visionMaxCorrectionDeg)", measured);
+
+                } else {
+
+                    double gain = clamp(finiteOr(visionCorrectionGain, 0.5), 0.0, 1.0);
+
+                    visionCorrectionDeg = visionCorrectionValid
+                            ? visionCorrectionDeg + gain * (measured - visionCorrectionDeg)
+                            : measured;
+
+                    visionCorrectionValid = true;
+                    lastVisionCorrectionNs = now;
+                    lastVisionStatus = "LOCKED";
+                }
+            }
+
+        } else if (!visionSeen) {
+
+            lastVisionStatus = visionCorrectionValid ? "TAGS LOST - HOLDING" : "NO TAGS";
+        }
+
+        if (!visionCorrectionValid) {
+            lastVisionCorrectionDeg = 0.0;
+            return 0.0;
+        }
+
+        // Hold, then fade out, once frames stop coming in.
+        double sinceMs = (now - lastVisionCorrectionNs) / 1_000_000.0;
+        double holdMs = Math.max(0.0, finiteOr(visionHoldMs, 3000.0));
+        double fadeMs = Math.max(1.0, finiteOr(visionFadeMs, 2000.0));
+
+        double scale = 1.0;
+        if (sinceMs > holdMs) {
+            scale = 1.0 - (sinceMs - holdMs) / fadeMs;
+        }
+
+        if (scale <= 0.0) {
+            clearVisionCorrection();
+            lastVisionStatus = "NO TAGS";
+            return 0.0;
+        }
+
+        if (scale < 1.0) {
+            lastVisionStatus = "TAGS LOST - FADING";
+        }
+
+        lastVisionCorrectionDeg = visionCorrectionDeg * scale;
+        return lastVisionCorrectionDeg;
+    }
+
+    // ---------------------------------------------------------------------
+    // Vision-only aiming (odometry offline)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Aims from the camera alone, for when odometry is offline. Each new,
+     * settled frame steps the turret by visionOnlyGain x bearing. With no
+     * tags it holds its angle for visionHoldMs, then centres.
+     *
+     * Call setVisionMeasurement() first.
+     */
+    public void aimVisionOnly() {
+
+        if (turretServo == null) {
+            return;
+        }
+
+        long now = System.nanoTime();
+
+        boolean recentlySeen = lastVisionSeenNs != 0L
+                && (now - lastVisionSeenNs) / 1_000_000.0
+                <= Math.max(0.0, finiteOr(visionHoldMs, 3000.0));
+
+        if (!recentlySeen) {
+            setCentre();
+            lastVisionStatus = "VISION ONLY: NO TAGS - CENTRED";
+            return;
+        }
+
+        // Starting from a fixed position: begin from where the servo is.
+        if (!visionOnlyMode) {
+            visionOnlyMode = true;
+            lastUsedVisionFrameId = -1L;
+        }
+
+        double angleDeg = lastFinalAngleDeg;
+
+        if (visionSeen
+                && visionFrameId != lastUsedVisionFrameId
+                && isTurretSettled()) {
+
+            lastUsedVisionFrameId = visionFrameId;
+
+            double gain = clamp(finiteOr(visionOnlyGain, 0.7), 0.0, 1.0);
+            angleDeg = lastFinalAngleDeg
+                    + gain * (visionBearingDeg + finiteOr(cameraYawOffsetDeg, 0.0));
+
+            lastVisionStatus = "VISION ONLY: TRACKING";
+
+        } else if (!visionSeen) {
+
+            lastVisionStatus = "VISION ONLY: TAGS LOST - HOLDING";
+        }
+
+        double maximumDeg = getAutoAimMaxAngleDeg();
+        double commandedDeg = clamp(angleDeg, -maximumDeg, maximumDeg);
+
+        double servoPosition = clampToServoLimits(
+                angleToServoPosition(Math.toRadians(commandedDeg))
+                        + finiteOr(AIM_OFFSET, 0.0));
+
+        double deadband = Double.isFinite(servoDeadband) ? Math.abs(servoDeadband) : 0.0;
+
+        if (Double.isNaN(lastCommandedServo)
+                || Math.abs(servoPosition - lastCommandedServo) >= deadband) {
+            turretServo.setPosition(servoPosition);
+            lastCommandedServo = servoPosition;
+        }
+
+        lastFinalAngleDeg = commandedDeg;
+        trackSettle(lastFinalAngleDeg);
+
+        lastServoPosition = lastCommandedServo;
+        lastFixedPositionMode = false;
+        lastTargetReachable = Math.abs(angleDeg) <= maximumDeg;
+        lastHoldingBehind = !lastTargetReachable;
+        lastRelativeAngleDeg = Double.NaN;
+        lastFieldTargetAngleDeg = Double.NaN;
+
+        currentAimSource = AimSource.VISION_ONLY;
+        lastAimSource = currentAimSource.name();
+    }
+
+    /** True while vision-only aiming is in control of the turret. */
+    public boolean isVisionOnlyAim() {
+
+        return currentAimSource == AimSource.VISION_ONLY;
+    }
+
+    /**
+     * Vision-only: the cluster is visible, the turret is settled and the
+     * last bearing was within visionOnTargetDeg.
+     */
+    public boolean isVisionOnTarget() {
+
+        return visionSeen
+                && isTurretSettled()
+                && Math.abs(visionBearingDeg + finiteOr(cameraYawOffsetDeg, 0.0))
+                <= Math.abs(finiteOr(visionOnTargetDeg, 2.0));
+    }
+
+    // ---------------------------------------------------------------------
+    // Settle tracking
+    // ---------------------------------------------------------------------
+
+    private void trackSettle(double commandedDeg) {
+
+        if (Double.isNaN(settleRefAngleDeg)
+                || Math.abs(commandedDeg - settleRefAngleDeg)
+                > Math.abs(finiteOr(visionSettleDeg, 1.0))) {
+
+            settleRefAngleDeg = commandedDeg;
+            settleSinceNs = System.nanoTime();
+        }
+    }
+
+    /** True once the commanded angle has been steady for visionSettleMs. */
+    public boolean isTurretSettled() {
+
+        return settleSinceNs != 0L
+                && (System.nanoTime() - settleSinceNs) / 1_000_000.0
+                >= Math.max(0.0, finiteOr(visionSettleMs, 120.0));
+    }
+
+    // ---------------------------------------------------------------------
     // Internal calculations
     // ---------------------------------------------------------------------
 
@@ -1264,6 +1665,19 @@ public class Turret {
         }
 
         return normalized;
+    }
+
+    private static double normalizeDegrees180(double angleDegrees) {
+
+        double a = angleDegrees % 360.0;
+        if (a >= 180.0) a -= 360.0;
+        if (a < -180.0) a += 360.0;
+        return a;
+    }
+
+    private static double finiteOr(double value, double fallback) {
+
+        return Double.isFinite(value) ? value : fallback;
     }
 
     private static double clamp(

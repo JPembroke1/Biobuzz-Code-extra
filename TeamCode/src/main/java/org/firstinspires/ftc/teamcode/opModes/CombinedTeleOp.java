@@ -1,5 +1,6 @@
 package org.firstinspires.ftc.teamcode.opModes;
 
+import com.buildingblockrobotics.expander.BBRDigitalExpander;
 import com.bylazar.configurables.annotations.Configurable;
 import com.pedropathing.drivetrain.DrivePowers;
 import com.pedropathing.follower.Follower;
@@ -7,9 +8,14 @@ import com.pedropathing.math.Pose;
 import com.qualcomm.hardware.lynx.LynxModule;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.Gamepad;
+import com.qualcomm.robotcore.util.ElapsedTime;
+import com.qualcomm.robotcore.util.RobotLog;
 
 import org.firstinspires.ftc.teamcode.opModes.subClasses.Flower;
 import org.firstinspires.ftc.teamcode.opModes.subClasses.Intake;
+import org.firstinspires.ftc.teamcode.opModes.subClasses.LimelightCam;
 import org.firstinspires.ftc.teamcode.opModes.subClasses.Outtake;
 import org.firstinspires.ftc.teamcode.opModes.subClasses.PoseStorage;
 import org.firstinspires.ftc.teamcode.opModes.subClasses.RobotConstants;
@@ -32,6 +38,49 @@ import java.util.List;
  * The goal coordinates themselves are the RED_/BLUE_ UPPER/LOWER fields
  * in this class. The Turret's own RED_LOW_GOAL_X/Y style coordinate
  * fields are not used by this TeleOp.
+ *
+ * Feeding: the safety checks (shooter on, aim, regression, at speed) are
+ * made once when the right trigger starts a burst. While the trigger stays
+ * held the burst keeps going, so the flywheel dipping after each ball does
+ * not stop and restart the feed. Set checkOnlyAtBurstStart = false to
+ * go back to checking every loop.
+ *
+ * Robustness (disconnect investigation):
+ *  1. stop() does not call follower.update(). That reads the Pinpoint over
+ *     I2C and can block stop() if the bus has faulted, which makes the SDK
+ *     restart the robot. The SDK zeroes all motors on stop anyway.
+ *  2. Slow loops are written to the robot log and the worst loop time is
+ *     shown in telemetry.
+ *  3. ODOMETRY FALLBACK. If follower.update() throws, returns an invalid
+ *     pose, or is repeatedly slow (Pinpoint I2C fault after a hit), the
+ *     TeleOp stops using Pedro and drives the four wheels directly, so the
+ *     robot keeps driving. While in fallback:
+ *       - the turret is locked to centre and auto aim is off;
+ *       - fixed-turret shooting stays available (fixed TPS, no regression);
+ *       - corner resets are blocked (the pose is not being tracked).
+ *     It probes the Pinpoint every odometryRetryIntervalMs and returns to
+ *     Pedro after odometryRecoverCount good updates in a row. The turret
+ *     stays centred after recovery until a corner reset re-establishes the
+ *     pose; auto aim and regression then come back by themselves.
+ *
+ * Shooting mode (see updateShootingMode):
+ *   NORMAL  = auto aim + lookup-table distance regression. This is the
+ *             default whenever the pose is good.
+ *   FIXED   = turret locked centre + fixed TPS (RobotConstants.outtakeTps).
+ *             Used only when there is no trustworthy distance: odometry
+ *             offline (Pinpoint fault), or no pose yet (do a corner reset).
+ *             The manual G2 Square / G1 Circle overrides are off by default
+ *             (allowManualFixedShooting, allowManualRegressionToggle).
+ *
+ * Limelight (on the turret): odometry gives the coarse aim; when the goal
+ * cluster is visible its bearing corrects the aim (Turret "Vision
+ * correction"). With odometry offline or no pose, the turret aims from the
+ * camera alone (VISION ONLY) at fixed TPS, and feeding waits until the
+ * camera says it's on target. If the Limelight is missing, everything
+ * works as before.
+ *
+ * The four drive motor names below match drivetrainConfig in pedro/Constants.java;
+ * test the fallback on blocks (see fallbackStrafeSign / fallbackTurnSign).
  */
 @Configurable
 @TeleOp(name = "0. Combined TeleOp", group = "Main")
@@ -59,28 +108,175 @@ public class CombinedTeleOp extends OpMode {
     public static double BLUE_LOWER_RESET_HEADING_DEG = 270.0;
     public static double BLUE_UPPER_RESET_HEADING_DEG = 90.0;
 
+    public static double RED_INFRONT_X = 59.06;
+    public static double BLUE_INFRONT_X = 80.0;
+    public static double RED_INFRONT_HEADING_DEG = 90.0;
+    public static double BLUE_INFRONT_HEADING_DEG = 90.0;
+
     public static double FORWARD_SIGN = -1.0;
     public static double STRAFE_SIGN = -1.0;
     public static double TURN_SIGN = -1.0;
     public static boolean CUBIC_STRAFE_TURN = false;
 
     public static boolean ALLOW_FIXED_TURRET_FEED = true;
+
+    /** Use the Limelight for aiming. Off = odometry-only aim, as before. */
+    public static boolean visionEnabled = true;
+    /** With odometry offline or no pose, aim from the camera instead of locking centre. */
+    public static boolean visionOnlyWhenNoPose = true;
     public static boolean FIXED_TURRET_BYPASSES_REGRESSION = true;
+
+    /*
+     * Distance regression (lookup table) on when TeleOp starts.
+     */
+    public static boolean REGRESSION_ON_AT_START = true;
+
+    /*
+     * Manual overrides. Both false = the robot always uses auto aim +
+     * regression, and only drops to fixed turret + fixed TPS by itself
+     * when odometry is offline or the pose is not set.
+     *   allowManualFixedShooting:    G2 Square forces fixed shooting,
+     *                                G1 Square returns to auto.
+     *   allowManualRegressionToggle: G1 Circle turns regression off/on.
+     */
+    public static boolean allowManualFixedShooting = false;
+    public static boolean allowManualRegressionToggle = false;
+
+    /*
+     * Feeding.
+     * gateOpenDelayS: time for the gate servo to open before the feeder
+     * and intake push balls through. Real seconds, so it no longer depends
+     * on loop speed. Tune this down until balls start catching the gate.
+     * checkOnlyAtBurstStart: see class comment.
+     */
+    // 0.15 -> 0.10 (24 Nov 2026): logs showed every normal shot waiting ~185 ms
+    // on the gate. Lower to 0.08 if balls don't catch; raise if they do.
+    public static double gateOpenDelayS = 0.10;
+    public static boolean checkOnlyAtBurstStart = true;
+
+    /*
+     * false = fire even if the turret thinks the goal is outside its range
+     * or the aim isn't settled. true = old behaviour (block the shot).
+     */
+    public static boolean requireAimReady = false;
+
+    /*
+     * Auto spin-up: the intake sensor watches the dedicated fourth-ball
+     * spot. When a ball is confirmed there (held for
+     * Intake.ballConfirmDelaySeconds) the robot is full, so the shooter
+     * turns on by itself once RB (collect) is released, provided the spot
+     * is still full. Fires once each time that spot fills.
+     */
+    public static boolean autoSpinUpEnabled = true;
+
+    /*
+     * false (default): auto spin-up only arms once the fourth-ball sensor has
+     * been seen EMPTY at least once after Start, so a sensor that reads
+     * "full" at start-up (or a ball already sitting there) cannot turn the
+     * shooter on by itself. The drivers use G1 Cross if they start loaded.
+     * true: old behaviour, a robot that starts full spins up straight away.
+     */
+    public static boolean spinUpIfFullAtStart = false;
+
+    /*
+     * Flywheel idle (24 Nov 2026). Logs showed shots waiting 0.5-2.5 s
+     * because collecting (RB) turned the shooter off and it had to spin up
+     * from rest. Now collecting drops the flywheel to an IDLE speed instead,
+     * and it keeps idling until G1 Triangle turns it fully off. Pulling RT
+     * while idle (or off) brings it straight up to full speed.
+     *   shooterOffWhileCollecting = true  -> old behaviour (off while RB held)
+     *   collectIdleFraction: idle speed as a fraction of the shot speed
+     *                        (0.7 = 70%; 1.0 = stay at full speed)
+     *   triggerStartsShooter: RT spins the shooter up if it isn't at full
+     */
+    public static boolean shooterOffWhileCollecting = false;
+    public static double collectIdleFraction = 0.7;
+    public static boolean triggerStartsShooter = true;
+
+    // Telemetry is built and sent at most this often (ms). Saves loop time.
+    public static double telemetryIntervalMs = 100.0;
+
+    /*
+     * Diagnostics. Any loop slower than slowLoopWarnMs is written to the
+     * robot log as a warning.
+     */
+    public static double slowLoopWarnMs = 100.0;
+
+    /*
+     * Odometry fallback.
+     *
+     * Motor names MUST match drivetrainConfig in pedro/Constants.java
+     * (frontLeftName, frontRightName, backLeftName, backRightName). Pedro's
+     * Mecanum has already set each motor's direction from that config, and
+     * hardwareMap hands back the same motor objects, so no direction
+     * settings are needed here.
+     *
+     * If the robot strafes or turns the wrong way in fallback (test with the
+     * wheels off the ground by setting forceFallbackDrive = true), flip
+     * fallbackStrafeSign or fallbackTurnSign to -1.
+     */
+    public static boolean fallbackDriveEnabled = true;
+    public static boolean forceFallbackDrive = false;   // testing only
+    public static String frontLeftName = "frontLeft";
+    public static String frontRightName = "frontRight";
+    public static String backLeftName = "backLeft";
+    public static String backRightName = "backRight";
+    public static double fallbackStrafeSign = 1.0;
+    public static double fallbackTurnSign = 1.0;
+
+    // follower.update() slower than this counts as a bad update
+    public static double odometrySlowUpdateMs = 50.0;
+    // this many slow updates in a row switches to fallback
+    // (an exception or an invalid pose switches immediately)
+    public static int odometrySlowLimit = 2;
+    /** Heading snap (G2 D-pad right) refuses if the heading is further than this from a wall angle. */
+    public static double headingSnapMaxErrorDeg = 20.0;
+    // while in fallback, how often to test whether the Pinpoint is back
+    public static double odometryRetryIntervalMs = 1000.0;
+    // good updates in a row needed to switch back to Pedro
+    public static int odometryRecoverCount = 5;
+
+    /*
+     * Controller feedback for the drive team (both gamepads):
+     *   light bar RED    = odometry offline, turret locked centre
+     *   light bar YELLOW = odometry OK but pose not set: do a corner reset
+     *                      (fixed turret + fixed TPS until then)
+     *   light bar GREEN  = pose good: auto aim + regression active
+     *   long rumble      = odometry just dropped out
+     *   two short blips  = odometry back
+     * Light bar works on PS4/PS5 controllers; rumble on most controllers.
+     */
+    public static boolean controllerFeedback = true;
 
     public enum AllianceMode { STORED, RED, BLUE }
     public static AllianceMode ALLIANCE_MODE = AllianceMode.STORED;
+
+    private static final String logTag = "CombinedTeleOp";
 
     private PoseStorage.Alliance activeAlliance = PoseStorage.Alliance.UNKNOWN;
     private Follower follower;
     private Intake intake;
     private Outtake outtake;
     private Turret turret;
+    private LimelightCam limelightCam;
+    private boolean visionAvailable;
+    private double visionMs;
     private Flower flower;
     private RobotSettings robotSettings;
     private List<LynxModule> hubs;
 
-    private boolean shooterActive;
-    private boolean autoAimMode = true;
+    // Direct drive motors for the odometry fallback
+    private DcMotorEx frontLeft;
+    private DcMotorEx frontRight;
+    private DcMotorEx backLeft;
+    private DcMotorEx backRight;
+    private boolean fallbackAvailable;
+
+    private boolean shooterActive;   // full speed
+    private boolean shooterIdle;     // spinning at idle speed
+    private boolean autoAimMode = false;
+    private boolean manualFixedRequested;
+    private String fixedReason = "";
     private boolean flowerActive;
     private boolean poseEstablished;
     private boolean poseResetThisLoop;
@@ -95,7 +291,73 @@ public class CombinedTeleOp extends OpMode {
     private boolean feederRequested;
     private boolean feederPermitted;
     private boolean fixedTurretFeedOverride;
+    private boolean burstActive;
+
+    // Fire-delay diagnostics: time from pulling RT to the feeder starting
+    private final ElapsedTime triggerTimer = new ElapsedTime();
+    private boolean previousShootTrigger;
+    private boolean waitingToFire;
+    private String currentFireWaitReason = "none";
+    private double lastFireDelayMs;
+    private String lastFireWaitReason = "none";
+    private boolean gateOpen;
+    private boolean previousFullSlot;
+    private boolean autoSpinUpPending;
+    private boolean autoSpinUpArmed;
+    private double shooterTpsOffset;
     private String feederBlockReason = "NOT REQUESTED";
+
+    private final ElapsedTime gateTimer = new ElapsedTime();
+    private final ElapsedTime loopTimer = new ElapsedTime();
+    private final ElapsedTime telemetryTimer = new ElapsedTime();
+    private final ElapsedTime followerUpdateTimer = new ElapsedTime();
+    private final ElapsedTime odometryRetryTimer = new ElapsedTime();
+    private double loopMs;
+    private double avgLoopMs;
+
+    // Diagnostics
+    private double maxLoopMs;
+    private int slowLoopCount;
+
+    /*
+     * Loop profiler: how long each part of loop() took last time (ms).
+     * "sdk" is everything outside loop(): the SDK's own work between loops,
+     * including sending telemetry and gamepad data.
+     */
+    public static boolean loopProfilerEnabled = false;   // true to diagnose loop time
+    private final ElapsedTime sectionTimer = new ElapsedTime();
+    private double controlsMs;
+    private double driveMs;
+    private double aimMs;
+    private double outtakeMs;
+    private double feedMs;
+    private double displayMs;
+    private double loopBodyMs;
+    private String bulkTimingText = "";
+    private int odometryErrorCount;
+    private String lastOdometryError = "none";
+    private double lastFollowerUpdateMs;
+
+    // Odometry fallback state
+    private boolean odometryFaulted;
+    private boolean lastFailureWasSlowOnly;
+    private int consecutiveSlowUpdates;
+    private int consecutiveGoodProbes;
+    private int odometryDropoutCount;
+
+    // Controller light bar state last sent (-1 = none yet)
+    private static final int ledOffline = 0;
+    private static final int ledNeedsReset = 1;
+    private static final int ledReady = 2;
+    private int controllerLedState = -1;
+
+    // Heading health (BBR expander). A hard hit can clip the expander's gyro;
+    // the expander latches a flag, and the heading may be off from then on.
+    // headingSuspect turns the light bar yellow until a corner reset,
+    // goal reset or heading snap.
+    private boolean headingSuspect;
+    private boolean gyroSaturationSeen;
+    private boolean previousHeadingSnapButton;
 
     private boolean previousFlowerButton;
     private boolean previousRegressionButton;
@@ -103,6 +365,7 @@ public class CombinedTeleOp extends OpMode {
     private boolean previousCentreButton;
     private boolean previousLowerResetButton;
     private boolean previousUpperResetButton;
+    private boolean previousInfrontResetButton;
     private boolean previousLowerGoalButton;
     private boolean previousUpperGoalButton;
     private boolean previousAutomaticGoalButton;
@@ -115,6 +378,17 @@ public class CombinedTeleOp extends OpMode {
         hubs = hardwareMap.getAll(LynxModule.class);
         for (LynxModule hub : hubs) hub.setBulkCachingMode(LynxModule.BulkCachingMode.MANUAL);
 
+        // Same motor objects Pedro uses, so their directions are already set
+        frontLeft = hardwareMap.tryGet(DcMotorEx.class, frontLeftName);
+        frontRight = hardwareMap.tryGet(DcMotorEx.class, frontRightName);
+        backLeft = hardwareMap.tryGet(DcMotorEx.class, backLeftName);
+        backRight = hardwareMap.tryGet(DcMotorEx.class, backRightName);
+        fallbackAvailable = frontLeft != null && frontRight != null
+                && backLeft != null && backRight != null;
+        if (!fallbackAvailable) {
+            RobotLog.ww(logTag, "Fallback drive unavailable: check drive motor names");
+        }
+
         intake = new Intake();
         outtake = new Outtake();
         turret = new Turret();
@@ -123,15 +397,17 @@ public class CombinedTeleOp extends OpMode {
         intake.init(hardwareMap);
         outtake.init(hardwareMap);
         turret.init(hardwareMap);
+        initLimelight();
         flower.init(hardwareMap);
         robotSettings.init(hardwareMap);
 
-        Outtake.DISTANCE_REGRESSION_ENABLED = false;
+        Outtake.DISTANCE_REGRESSION_ENABLED = REGRESSION_ON_AT_START;
         Outtake.HOOD_COMP_ENABLED = false;
         Turret.velocityCompensationActive = false;
         turret.setCentre();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         robotSettings.block();
+        gateOpen = false;
 
         activeAlliance = resolveAlliance();
         Pose savedPose = PoseStorage.getPose();
@@ -142,6 +418,9 @@ public class CombinedTeleOp extends OpMode {
         } else {
             poseEstablished = false;
             status = "No stored pose; perform a corner reset";
+        }
+        if (!fallbackAvailable && fallbackDriveEnabled) {
+            status += " | WARNING: fallback drive motor names not found";
         }
         displayTelemetry();
     }
@@ -156,8 +435,7 @@ public class CombinedTeleOp extends OpMode {
         updateGoalFromPose(poseEstablished ? follower.pose() : null);
         turret.setCentre();
         flowerActive = false;
-        flower.flowerActivate(RobotConstants.flowerLiftPos);
-        displayTelemetry();
+        maybeDisplayTelemetry();
     }
 
     @Override
@@ -167,7 +445,11 @@ public class CombinedTeleOp extends OpMode {
         else if (activeAlliance == PoseStorage.Alliance.BLUE) PoseStorage.setBlue();
 
         shooterActive = false;
-        autoAimMode = true;
+        shooterIdle = false;
+        // updateShootingMode() decides auto vs fixed on the first loop
+        autoAimMode = false;
+        manualFixedRequested = false;
+        fixedReason = "";
         flowerActive = false;
         manualGoalMode = false;
         upperGoalSelected = false;
@@ -175,9 +457,16 @@ public class CombinedTeleOp extends OpMode {
         targetValid = false;
         goalX = goalY = distanceToGoalIn = Double.NaN;
         fixedTurretFeedOverride = false;
+        burstActive = false;
+        previousFullSlot = false;
+        autoSpinUpPending = false;
+        // Armed now only if starting full should spin up; otherwise the slot
+        // must read empty first (see spinUpIfFullAtStart)
+        autoSpinUpArmed = spinUpIfFullAtStart;
+        shooterTpsOffset = 0.0;
         feederBlockReason = "NOT REQUESTED";
         flower.flowerActivate(RobotConstants.flowerLiftPos);
-        Outtake.DISTANCE_REGRESSION_ENABLED = false;
+        Outtake.DISTANCE_REGRESSION_ENABLED = REGRESSION_ON_AT_START;
         Outtake.HOOD_COMP_ENABLED = false;
 
         previousFlowerButton = gamepad1.dpad_right;
@@ -189,24 +478,57 @@ public class CombinedTeleOp extends OpMode {
         previousLowerGoalButton = gamepad2.cross;
         previousUpperGoalButton = gamepad2.circle;
         previousAutomaticGoalButton = gamepad2.triangle;
+        previousInfrontResetButton = gamepad1.dpad_down;
+        previousHeadingSnapButton = gamepad2.dpad_right;
 
-        if (activeAlliance == PoseStorage.Alliance.RED) status = "LOCKED ALLIANCE: RED";
-        else if (activeAlliance == PoseStorage.Alliance.BLUE) status = "LOCKED ALLIANCE: BLUE";
-        else { autoAimMode = false; turret.setCentre(); status = "UNKNOWN ALLIANCE - AUTO AIM DISABLED"; }
+        String regressionText = Outtake.DISTANCE_REGRESSION_ENABLED ? " | REGRESSION ON" : " | FIXED TPS";
+        if (activeAlliance == PoseStorage.Alliance.RED) status = "LOCKED ALLIANCE: RED" + regressionText;
+        else if (activeAlliance == PoseStorage.Alliance.BLUE) status = "LOCKED ALLIANCE: BLUE" + regressionText;
+        else status = "UNKNOWN ALLIANCE - fixed shooting only";
+
+        maxLoopMs = 0.0;
+        slowLoopCount = 0;
+        odometryErrorCount = 0;
+        lastOdometryError = "none";
+        lastFollowerUpdateMs = 0.0;
+        odometryFaulted = false;
+        consecutiveSlowUpdates = 0;
+        consecutiveGoodProbes = 0;
+        odometryDropoutCount = 0;
+        controllerLedState = -1;
+        RobotLog.ii(logTag, "TeleOp started, alliance %s", allianceLabel());
+
+        if (forceFallbackDrive) enterOdometryFallback("FORCED FOR TEST");
+
+        loopTimer.reset();
+        avgLoopMs = 0.0;
     }
 
     @Override
     public void loop() {
-        clearBulkCache();
+        loopMs = loopTimer.milliseconds();
+        loopTimer.reset();
+        avgLoopMs = avgLoopMs == 0.0 ? loopMs : avgLoopMs + 0.1 * (loopMs - avgLoopMs);
+        recordLoopTime(loopMs);
+
+        double bodyStart = loopTimer.milliseconds();
+        clearBulkCacheTimed();
         poseResetThisLoop = false;
 
+        sectionTimer.reset();
         handleCornerResets();
+        handleHiveResets();
+        handleHeadingSnap();
         handleShooterControls();
         handleFlowerControls();
         handleRegressionToggle();
+        controlsMs = lap();
 
         if (!poseResetThisLoop) driveRobot();
+        else if (odometryFaulted) setDirectDrivePowers(0.0, 0.0, 0.0);
         else follower.manual(new DrivePowers(0.0, 0.0, 0.0));
+        driveMs = lap();
+        checkHeadingHealth();
 
         Pose currentPose = follower.pose();
         if (poseEstablished && validPose(currentPose)) PoseStorage.setPose(currentPose);
@@ -216,121 +538,304 @@ public class CombinedTeleOp extends OpMode {
         else updateGoalFromPose(currentPose);
 
         handleTurretModeControls();
-        updateTurretAim(currentPose);
+        updateShootingMode();
+        updateVision();
+        if (autoAimMode) updateTurretAim(currentPose);
+        else if (canAimVisionOnly()) aimVisionOnly();
+        else lockTurretCentre();
 
         boolean fixedShootingMode = ALLOW_FIXED_TURRET_FEED
                 && !autoAimMode
                 && turret.isFixedPositionMode();
 
-        outtake.setGoalDistance(!fixedShootingMode
+        // Distance only at full speed, so the lookup table doesn't override idle
+        outtake.setGoalDistance(shooterActive
+                && !fixedShootingMode
                 && targetValid
                 && poseEstablished
                 && Double.isFinite(distanceToGoalIn)
                 ? distanceToGoalIn : Double.NaN);
+        aimMs = lap();
 
-        // One update only. Calling Outtake.update() twice may distort its PID/TPS timing.
+        // One update only. Calling Outtake.update() twice may distort its timing.
         outtake.update();
+        outtakeMs = lap();
+
         handleIntakeAndFeeder();
         intake.update();
-        displayTelemetry();
+        feedMs = lap();
+
+        updateControllerLed();
+        maybeDisplayTelemetry();
+        displayMs = lap();
+
+        loopBodyMs = loopTimer.milliseconds() - bodyStart;
+    }
+
+    /** Milliseconds since the last lap() (or sectionTimer reset). */
+    private double lap() {
+        double ms = sectionTimer.milliseconds();
+        sectionTimer.reset();
+        return ms;
+    }
+
+    /**
+     * Clears the bulk cache and, when the profiler is on, reads each hub
+     * straight away so the time for every hub's bulk read is measured on
+     * its own. A hub that is slow or dropping out shows up here.
+     */
+    private void clearBulkCacheTimed() {
+        if (hubs == null) return;
+        if (!loopProfilerEnabled) {
+            clearBulkCache();
+            return;
+        }
+        StringBuilder text = new StringBuilder();
+        for (LynxModule hub : hubs) {
+            hub.clearBulkCache();
+            sectionTimer.reset();
+            hub.getBulkData();
+            double ms = sectionTimer.milliseconds();
+            if (text.length() > 0) text.append(" | ");
+            text.append(hub.isParent() ? "CH" : "EH" + hub.getModuleAddress())
+                    .append(String.format(" %.0f", ms));
+        }
+        bulkTimingText = text.toString();
+    }
+
+    /**
+     * Shows the odometry / pose state on both controllers' light bars.
+     * Only sends a command when the state changes.
+     */
+    private void updateControllerLed() {
+        if (!controllerFeedback) return;
+        int state = odometryFaulted ? ledOffline
+                : (!poseEstablished || headingSuspect) ? ledNeedsReset
+                  : ledReady;
+        if (state == controllerLedState) return;
+        controllerLedState = state;
+
+        double r = state == ledReady ? 0.0 : 1.0;
+        double g = state == ledOffline ? 0.0 : 1.0;
+        gamepad1.setLedColor(r, g, 0.0, Gamepad.LED_DURATION_CONTINUOUS);
+        gamepad2.setLedColor(r, g, 0.0, Gamepad.LED_DURATION_CONTINUOUS);
+    }
+
+    /** Tracks the worst loop and logs any slow loop. */
+    private void recordLoopTime(double ms) {
+        if (ms > maxLoopMs) maxLoopMs = ms;
+        if (ms > slowLoopWarnMs) {
+            slowLoopCount++;
+            RobotLog.ww(logTag, "Slow loop: %.0f ms (count %d)", ms, slowLoopCount);
+        }
     }
 
     private void handleShooterControls() {
-        if (gamepad1.right_bumper) shooterActive = false;
+        boolean collect = gamepad1.right_bumper;
+        boolean fullSlot = intake.isBallConfirmed();
+
+        // The slot has been seen empty, so the next fill is a real fourth ball
+        if (!Intake.sensorTriggered) autoSpinUpArmed = true;
+
+        // Fourth-ball spot just filled: arm a spin-up
+        if (autoSpinUpEnabled && autoSpinUpArmed && fullSlot && !previousFullSlot) {
+            autoSpinUpPending = true;
+        }
+        // Spot emptied again (false detection or ball moved): cancel it
+        if (!fullSlot) autoSpinUpPending = false;
+        previousFullSlot = fullSlot;
+
+        // Collecting: drop to idle (or off, old behaviour). The auto spin-up
+        // waits until RB is released, and only happens if the spot is still full.
+        if (collect) {
+            shooterActive = false;
+            shooterIdle = !shooterOffWhileCollecting;
+        } else if (autoSpinUpPending) {
+            autoSpinUpPending = false;
+            shooterActive = true;
+            status = "Loaded: shooter auto spin-up";
+        }
+
+        // RT while not at full speed: spin straight up (from idle is quick)
+        if (triggerStartsShooter && !collect && !shooterActive
+                && gamepad1.right_trigger > 0.3) {
+            shooterActive = true;
+        }
+
         if (gamepad1.cross) shooterActive = true;
-        if (gamepad1.triangle) shooterActive = false;
-        outtake.setTargetTPS(shooterActive ? Math.max(0.0, RobotConstants.OUTTAKE_TPS) : 0.0);
-        outtake.setHoodPosition(RobotConstants.HOOD_POSITION);
-
-        if (gamepad2.leftBumperWasPressed()) {
-            RobotConstants.OUTTAKE_TPS -= 20;
+        if (gamepad1.triangle) {
+            shooterActive = false;
+            shooterIdle = false;
+            autoSpinUpPending = false;
         }
+        // G2 bumpers nudge speed for this match only; D-pad left clears it
+        if (gamepad2.leftBumperWasPressed()) shooterTpsOffset -= RobotConstants.outtakeTpsStep;
+        if (gamepad2.rightBumperWasPressed()) shooterTpsOffset += RobotConstants.outtakeTpsStep;
+        if (gamepad2.dpadLeftWasPressed()) shooterTpsOffset = 0.0;
 
-        if (gamepad2.rightBumperWasPressed()) {
-            RobotConstants.OUTTAKE_TPS += 20;
-        }
-
-        if (gamepad2.dpadLeftWasPressed()) {
-            RobotConstants.OUTTAKE_TPS = 1950;
-        }
+        double shooterTps = Math.max(0.0, RobotConstants.outtakeTps + shooterTpsOffset);
+        double idleTps = shooterTps * Math.max(0.0, Math.min(1.0, collectIdleFraction));
+        outtake.setTargetTPS(shooterActive ? shooterTps : shooterIdle ? idleTps : 0.0);
+        outtake.setHoodPosition(RobotConstants.hoodPosition);
     }
 
     private void handleRegressionToggle() {
         boolean pressed = gamepad1.circle;
+        if (!allowManualRegressionToggle) {
+            // Regression stays on; fixed TPS is only used in FIXED mode
+            Outtake.DISTANCE_REGRESSION_ENABLED = true;
+            previousRegressionButton = pressed;
+            return;
+        }
         if (pressed && !previousRegressionButton) {
             Outtake.DISTANCE_REGRESSION_ENABLED = !Outtake.DISTANCE_REGRESSION_ENABLED;
             stopFeederOnly();
             intake.stopIntake();
-            //robotSettings.block();
             status = Outtake.DISTANCE_REGRESSION_ENABLED ? "REGRESSION ENABLED" : "FIXED TPS MODE";
         }
         previousRegressionButton = pressed;
     }
 
+    // ---------------------------------------------------------------------
+    // Intake and feeder
+    // ---------------------------------------------------------------------
+
+    /** Runs the intake/feeder logic, then records the fire delay. */
     private void handleIntakeAndFeeder() {
+        runIntakeAndFeeder();
+        measureFireDelay();
+
+    }
+
+    /**
+     * Measures how long it takes from pulling RT to the feeder actually
+     * starting, and remembers what it was waiting for (other than the gate).
+     * Shown in telemetry as "Fire Delay" and written to the robot log.
+     */
+    private void measureFireDelay() {
+        boolean trigger = gamepad1.right_trigger > 0.3 && !gamepad1.right_bumper;
+        if (trigger && !previousShootTrigger) {
+            triggerTimer.reset();
+            waitingToFire = true;
+            currentFireWaitReason = "none";
+        }
+        if (!trigger) waitingToFire = false;
+
+        if (waitingToFire) {
+            if (feederPermitted) {
+                lastFireDelayMs = triggerTimer.milliseconds();
+                lastFireWaitReason = currentFireWaitReason.equals("none")
+                        ? "gate only" : currentFireWaitReason;
+                waitingToFire = false;
+                RobotLog.ii(logTag, "Fire delay %.0f ms (waited on: %s)",
+                        lastFireDelayMs, lastFireWaitReason);
+            } else if (!feederBlockReason.equals("GATE OPENING")
+                    && !feederBlockReason.startsWith("FEEDING")) {
+                // Something other than the gate is holding the shot
+                currentFireWaitReason = feederBlockReason;
+            }
+        }
+        previousShootTrigger = trigger;
+    }
+
+    private void runIntakeAndFeeder() {
         feederRequested = false;
         feederPermitted = false;
-        fixedTurretFeedOverride = false;
-        feederBlockReason = "NOT REQUESTED";
 
+        // Collect
         if (gamepad1.right_bumper) {
-            intake.intake(RobotConstants.FRONT_INTAKE_SPEED, RobotConstants.BACK_INTAKE_SPEED);
-            robotSettings.block();
-            stopFeederOnly();
+            burstActive = false;
+            setGate(false);
+            intake.intake(RobotConstants.frontIntakeSpeed, RobotConstants.backIntakeSpeed);
+            outtake.stopFeeder();
             feederBlockReason = "COLLECTING";
             return;
         }
 
+        // Shoot
         if (gamepad1.right_trigger > 0.3) {
-            if (!feederAllowed()) {
-                robotSettings.block();
+            feederRequested = true;
+
+            // Never feed into a stopped flywheel, even mid-burst
+            if (!shooterActive) {
+                burstActive = false;
+            }
+
+            boolean needCheck = !burstActive || !checkOnlyAtBurstStart;
+            if (needCheck && !feederAllowed()) {
+                burstActive = false;
+                setGate(false);
                 intake.stopIntake();
-                stopFeederOnly();
+                outtake.stopFeeder();
                 return;
             }
-            robotSettings.release();
 
-            RobotConstants.timer += 0.1;
-
-            if (RobotConstants.timer > RobotConstants.delayAmount) {
-                intake.intake(RobotConstants.FRONT_FEED_SPEED, RobotConstants.BACK_FEED_SPEED);
-                outtake.setFeederTPS(RobotConstants.FEEDER_TPS);
-                feederRequested = true;
-                feederPermitted = true;
+            if (!burstActive) {
+                burstActive = true;
                 feederBlockReason = fixedTurretFeedOverride
                         ? "FEEDING: FIXED TURRET" : "FEEDING: AUTO AIM";
-                return;
             }
-        } else {
-            RobotConstants.timer = 0;
-            robotSettings.block();
+            setGate(true);
+
+            if (gateTimer.seconds() >= gateOpenDelayS) {
+                intake.intake(RobotConstants.frontFeedSpeed, RobotConstants.backFeedSpeed);
+                outtake.setFeederOn(true);
+                feederPermitted = true;
+            } else {
+                intake.stopIntake();
+                outtake.stopFeeder();
+                feederBlockReason = "GATE OPENING";
+            }
+            return;
         }
 
+        // Trigger released
+        burstActive = false;
+        setGate(false);
+
+        // Reverse intake
         if (gamepad1.left_bumper) {
-            intake.intake(-RobotConstants.FRONT_INTAKE_SPEED, -RobotConstants.BACK_INTAKE_SPEED);
-            robotSettings.block();
-            stopFeederOnly();
+            intake.intake(-RobotConstants.frontIntakeSpeed, -RobotConstants.backIntakeSpeed);
+            outtake.stopFeeder();
             feederBlockReason = "REVERSING INTAKE";
             return;
         }
 
         intake.stopIntake();
-        stopFeederOnly();
+        outtake.stopFeeder();
+        feederBlockReason = "NOT REQUESTED";
+    }
+
+    /** Opens or closes the gate, only talking to the servo when it changes. */
+    private void setGate(boolean open) {
+        if (open == gateOpen) return;
+        gateOpen = open;
+        if (open) {
+            robotSettings.release();
+            gateTimer.reset();
+        } else {
+            robotSettings.block();
+        }
     }
 
     private boolean feederAllowed() {
         fixedTurretFeedOverride = ALLOW_FIXED_TURRET_FEED
                 && !autoAimMode
-                && turret.isFixedPositionMode();
+                && (turret.isFixedPositionMode() || turret.isVisionOnlyAim());
 
         if (!shooterActive) return blockFeed("SHOOTER OFF");
+
+        if (turret.isVisionOnlyAim() && !turret.isVisionOnTarget())
+            return blockFeed("VISION NOT ON TARGET");
 
         if (!fixedTurretFeedOverride) {
             if (!autoAimMode) return blockFeed("AUTO AIM DISABLED");
             if (!poseEstablished) return blockFeed("POSE NOT ESTABLISHED");
             if (!targetValid) return blockFeed("TARGET INVALID");
-            if (!turret.isTargetReachable()) return blockFeed("TURRET UNREACHABLE");
-            if (!turret.isAimReady()) return blockFeed("AIM NOT READY");
+            if (requireAimReady) {
+                if (!turret.isTargetReachable()) return blockFeed("TURRET UNREACHABLE");
+                if (!turret.isAimReady()) return blockFeed("AIM NOT READY");
+            }
         }
 
         boolean regressionRequired = Outtake.DISTANCE_REGRESSION_ENABLED
@@ -338,12 +843,10 @@ public class CombinedTeleOp extends OpMode {
         if (regressionRequired && !outtake.isUsingDistanceRegression())
             return blockFeed("REGRESSION INVALID");
 
-        if (RobotConstants.FEED_REQUIRES_SPEED
-                && !outtake.isAtSpeed(RobotConstants.FEED_SPEED_TOLERANCE_TPS))
+        if (RobotConstants.feedRequiresSpeed
+                && !outtake.isAtSpeed(RobotConstants.feedSpeedToleranceTps))
             return blockFeed("SHOOTER NOT AT SPEED");
 
-        feederBlockReason = fixedTurretFeedOverride
-                ? "PERMITTED: FIXED TURRET" : "PERMITTED: AUTO AIM";
         return true;
     }
 
@@ -352,12 +855,20 @@ public class CombinedTeleOp extends OpMode {
         return false;
     }
 
+    /**
+     * Stops the feeder and ends the current burst, so the next shot re-runs
+     * the safety checks. Used when the goal, aim mode or pose changes.
+     */
     private void stopFeederOnly() {
         feederRequested = false;
         feederPermitted = false;
-        outtake.setFeederTPS(0.0);
+        burstActive = false;
         outtake.stopFeeder();
     }
+
+    // ---------------------------------------------------------------------
+    // Goal selection and aiming
+    // ---------------------------------------------------------------------
 
     private void handleManualGoalSelection() {
         boolean lower = gamepad2.cross;
@@ -438,36 +949,73 @@ public class CombinedTeleOp extends OpMode {
 
     private void handleFlowerControls() {
         boolean pressed = gamepad1.dpad_right;
-        if (pressed && !previousFlowerButton) flowerActive = !flowerActive;
+        if (pressed && !previousFlowerButton) {
+            flowerActive = !flowerActive;
+            // Only command the servo when it actually changes
+            flower.flowerActivate(flowerActive ? RobotConstants.flowerDropPos : RobotConstants.flowerLiftPos);
+        }
         previousFlowerButton = pressed;
-        flower.flowerActivate(flowerActive ? RobotConstants.flowerDropPos : RobotConstants.flowerLiftPos);
     }
 
+    /**
+     * Manual overrides only. Whether the robot is in auto aim or fixed
+     * shooting is decided in updateShootingMode().
+     */
     private void handleTurretModeControls() {
         boolean aim = gamepad1.square;
-        if (aim && !previousAimButton) {
-            if (allianceKnown() && poseEstablished && targetValid) {
-                autoAimMode = true;
-                fixedTurretFeedOverride = false;
-                turret.realignToSelectedGoal();
-                stopFeederOnly();
-                status = "Automatic aim enabled";
-            } else status = "Aim blocked: alliance, pose or target invalid";
+        if (aim && !previousAimButton && manualFixedRequested) {
+            manualFixedRequested = false;
+            status = "Manual fixed shooting cleared";
         }
         previousAimButton = aim;
 
         boolean centre = gamepad2.square;
         if (centre && !previousCentreButton) {
-            autoAimMode = false;
-            turret.setCentre();
-            stopFeederOnly();
-            fixedTurretFeedOverride = ALLOW_FIXED_TURRET_FEED;
-            feederBlockReason = ALLOW_FIXED_TURRET_FEED
-                    ? "FIXED TURRET SELECTED" : "FIXED FEED DISABLED";
-            status = ALLOW_FIXED_TURRET_FEED
-                    ? "Turret centred; fixed shooting available" : "Turret centred; feeding disabled";
+            if (allowManualFixedShooting) {
+                manualFixedRequested = true;
+                status = "Manual fixed shooting (G1 Square to return to auto)";
+            } else {
+                status = "Manual fixed shooting disabled (allowManualFixedShooting)";
+            }
         }
         previousCentreButton = centre;
+    }
+
+    /**
+     * NORMAL: auto aim + lookup-table regression (the default).
+     * FIXED:  turret centre + fixed TPS, only when there is no trustworthy
+     *         distance to the goal.
+     * Switches automatically in both directions, so after a Pinpoint
+     * dropout and a corner reset the robot goes straight back to NORMAL.
+     */
+    private void updateShootingMode() {
+        String reason = odometryFaulted ? "ODOMETRY OFFLINE"
+                : !allianceKnown() ? "ALLIANCE UNKNOWN"
+                  : !poseEstablished ? "NO POSE - CORNER RESET"
+                    : !targetValid ? "NO TARGET"
+                      : (allowManualFixedShooting && manualFixedRequested) ? "MANUAL"
+                        : "";
+        boolean needFixed = !reason.isEmpty();
+
+        if (needFixed) {
+            if (autoAimMode || !reason.equals(fixedReason)) {
+                // Mode changed mid-burst: stop feeding so checks re-run
+                stopFeederOnly();
+                status = "FIXED SHOOTING: " + reason;
+            }
+            fixedReason = reason;
+            autoAimMode = false;
+            return;
+        }
+
+        if (!autoAimMode) {
+            autoAimMode = true;
+            fixedTurretFeedOverride = false;
+            fixedReason = "";
+            turret.realignToSelectedGoal();
+            stopFeederOnly();
+            status = "AUTO AIM + REGRESSION";
+        }
     }
 
     private void updateTurretAim(Pose pose) {
@@ -481,14 +1029,98 @@ public class CombinedTeleOp extends OpMode {
         turret.aimTurret(pose, 0.0, 0.0);
     }
 
+    /**
+     * FIXED shooting: with no trustworthy pose, aiming from it would point
+     * the turret at the wrong place, so hold the turret at centre and shoot
+     * at fixed TPS. setCentre() only writes to the servo when the position
+     * changes, so calling it every loop is cheap.
+     */
+    private void lockTurretCentre() {
+        autoAimMode = false;
+        distanceToGoalIn = Double.NaN;
+        turret.setCentre();
+        fixedTurretFeedOverride = ALLOW_FIXED_TURRET_FEED;
+    }
+
+    // ---------------------------------------------------------------------
+    // Limelight
+    // ---------------------------------------------------------------------
+
+    /** Starts the Limelight. If it is missing, vision is just switched off. */
+    private void initLimelight() {
+        visionAvailable = false;
+        if (!visionEnabled) return;
+        try {
+            limelightCam = new LimelightCam(hardwareMap);
+            limelightCam.init();
+            visionAvailable = true;
+        } catch (RuntimeException e) {
+            limelightCam = null;
+            RobotLog.ee(logTag, e, "Limelight not available: odometry-only aiming");
+        }
+    }
+
+    /**
+     * Reads the newest Limelight result and hands the goal cluster's bearing
+     * to the turret. Cheap: the SDK polls the Limelight in the background.
+     */
+    private void updateVision() {
+        long startNs = System.nanoTime();
+        if (!visionAvailable || !visionEnabled || !allianceKnown()) {
+            turret.clearVisionMeasurement();
+            visionMs = 0.0;
+            return;
+        }
+        try {
+            limelightCam.update();
+            LimelightCam.HiveDetection d = limelightCam.getAimDetection(
+                    activeAlliance == PoseStorage.Alliance.RED
+                            ? LimelightCam.Alliance.RED : LimelightCam.Alliance.BLUE);
+            if (d != null) {
+                turret.setVisionMeasurement(true, d.bearing, limelightCam.getFrameId());
+            } else {
+                turret.clearVisionMeasurement();
+            }
+        } catch (RuntimeException e) {
+            turret.clearVisionMeasurement();
+            RobotLog.ee(logTag, e, "Limelight read failed");
+        }
+        visionMs = (System.nanoTime() - startNs) / 1_000_000.0;
+    }
+
+    /** No pose to aim from (odometry offline / not reset), but the camera can aim. */
+    private boolean canAimVisionOnly() {
+        return visionAvailable && visionEnabled && visionOnlyWhenNoPose
+                && allianceKnown()
+                && (odometryFaulted || !poseEstablished)
+                && !(allowManualFixedShooting && manualFixedRequested);
+    }
+
+    /**
+     * Turret aims from the camera, flywheel at fixed TPS (no trustworthy
+     * distance). Feeding waits for isVisionOnTarget() (feederAllowed()).
+     */
+    private void aimVisionOnly() {
+        autoAimMode = false;
+        distanceToGoalIn = Double.NaN;
+        turret.aimVisionOnly();
+        fixedTurretFeedOverride = ALLOW_FIXED_TURRET_FEED;
+    }
+
     private double calculateDistanceToGoal(Pose pose) {
         double h = pose.heading();
-        double pivotX = pose.x() + Turret.TURRET_OFFSET_X_IN * Math.cos(h)
-                - Turret.TURRET_OFFSET_Y_IN * Math.sin(h);
-        double pivotY = pose.y() + Turret.TURRET_OFFSET_X_IN * Math.sin(h)
-                + Turret.TURRET_OFFSET_Y_IN * Math.cos(h);
+        double cos = Math.cos(h);
+        double sin = Math.sin(h);
+        double pivotX = pose.x() + Turret.TURRET_OFFSET_X_IN * cos
+                - Turret.TURRET_OFFSET_Y_IN * sin;
+        double pivotY = pose.y() + Turret.TURRET_OFFSET_X_IN * sin
+                + Turret.TURRET_OFFSET_Y_IN * cos;
         return Math.hypot(goalX - pivotX, goalY - pivotY);
     }
+
+    // ---------------------------------------------------------------------
+    // Pose resets
+    // ---------------------------------------------------------------------
 
     private void handleCornerResets() {
         boolean lower = gamepad2.dpad_down;
@@ -499,8 +1131,106 @@ public class CombinedTeleOp extends OpMode {
         previousUpperResetButton = upper;
     }
 
+    private void handleHiveResets() {
+        boolean infront = gamepad1.dpad_down;
+
+        if (infront && !previousInfrontResetButton) resetInfrontOfGoal();
+        previousInfrontResetButton = infront;
+    }
+
+    /**
+     * G2 D-pad right: square the robot flat against ANY wall, then press.
+     * Snaps the heading to the nearest 90 degrees and keeps X and Y. Heading
+     * is the biggest source of aim error, so this fixes most of it from far
+     * more places than the corners. Refused if the heading is more than
+     * headingSnapMaxErrorDeg from a wall angle (robot not square, or heading
+     * too far gone to guess which wall).
+     */
+    private void handleHeadingSnap() {
+        boolean pressed = gamepad2.dpad_right;
+        if (pressed && !previousHeadingSnapButton) snapHeadingToWall();
+        previousHeadingSnapButton = pressed;
+    }
+
+    private void snapHeadingToWall() {
+        if (odometryFaulted) { status = "Heading snap blocked: odometry offline"; return; }
+        if (!poseEstablished) { status = "Heading snap blocked: do a corner reset first"; return; }
+
+        Pose pose = follower.pose();
+        if (!validPose(pose)) { status = "Heading snap blocked: no valid pose"; return; }
+
+        double headingDeg = Math.toDegrees(pose.heading());
+        double snappedDeg = Math.round(headingDeg / 90.0) * 90.0;
+        double errorDeg = headingDeg - snappedDeg;
+        if (Math.abs(errorDeg) > headingSnapMaxErrorDeg) {
+            status = String.format("Heading snap blocked: %.0f deg off a wall angle", errorDeg);
+            return;
+        }
+
+        Pose snapped = new Pose(pose.x(), pose.y(), Math.toRadians(snappedDeg));
+        try {
+            follower.setPose(snapped);
+        } catch (RuntimeException e) {
+            odometryErrorCount++;
+            lastOdometryError = e.getClass().getSimpleName();
+            RobotLog.ee(logTag, e, "follower.setPose() failed during heading snap");
+            status = "Heading snap failed: odometry not responding";
+            return;
+        }
+        poseResetThisLoop = true;
+        follower.manual(new DrivePowers(0.0, 0.0, 0.0));
+        PoseStorage.setPose(snapped);
+        headingSuspect = false;
+        turret.realignToSelectedGoal();
+        status = String.format("Heading snapped to %.0f deg (corrected %.1f deg)", snappedDeg, -errorDeg);
+        RobotLog.ii(logTag, "Heading snap: %.1f -> %.0f deg", headingDeg, snappedDeg);
+    }
+
+    /**
+     * Watches the expander's latched gyro-saturation flag. The first time it
+     * trips, rumbles both controllers and turns the light bar yellow until
+     * the drivers re-establish heading (corner reset, goal reset or heading
+     * snap). Auto aim keeps running; the drivers decide when to reset.
+     *
+     * The flag latches until the next full recalibration (init), so this
+     * only warns about the FIRST hard hit each match.
+     */
+    private void checkHeadingHealth() {
+        if (Constants.expanderLocalizer == null || odometryFaulted) return;
+        if (gyroSaturationSeen) return;
+        if (!Constants.expanderLocalizer.hasGyroEverSaturated()) return;
+
+        gyroSaturationSeen = true;
+        headingSuspect = true;
+        if (controllerFeedback) {
+            gamepad1.rumbleBlips(3);
+            gamepad2.rumbleBlips(3);
+        }
+        status = "HEADING SUSPECT after hit: corner reset or heading snap (G2 D-pad right)";
+        RobotLog.ww(logTag, "Expander gyro saturated: heading may have drifted");
+    }
+
+    private void resetInfrontOfGoal() {
+        if (!allianceKnown()) { status = "Goal reset blocked: alliance unknown"; return; }
+        if (odometryFaulted) { status = "Reset blocked: odometry offline"; return; }
+
+        boolean red = activeAlliance == PoseStorage.Alliance.RED;
+        double halfLength = ROBOT_LENGTH_MM / 25.4 / 2.0;
+
+        double x = red ? RED_INFRONT_X : BLUE_INFRONT_X;
+        double y = FIELD_SIZE_IN - halfLength;   // against the back wall
+        double heading = red ? RED_INFRONT_HEADING_DEG : BLUE_INFRONT_HEADING_DEG;
+
+        if (!validFieldPoint(x, y)) { status = "Goal reset blocked: invalid geometry"; return; }
+
+        if (applyPoseReset(new Pose(x, y, Math.toRadians(heading)))) {
+            status = (red ? "RED" : "BLUE") + " in-front-of-goal reset";
+        }
+    }
+
     private void resetAtAllianceCorner(boolean upper) {
         if (!allianceKnown()) { status = "Corner reset blocked: alliance unknown"; return; }
+        if (odometryFaulted) { status = "Corner reset blocked: odometry offline"; return; }
         double halfLength = ROBOT_LENGTH_MM / 25.4 / 2.0;
         double halfWidth = ROBOT_WIDTH_MM / 25.4 / 2.0;
         boolean red = activeAlliance == PoseStorage.Alliance.RED;
@@ -510,23 +1240,46 @@ public class CombinedTeleOp extends OpMode {
         double x = red ? halfWidth : FIELD_SIZE_IN - halfWidth;
         double y = upper ? FIELD_SIZE_IN - halfLength : halfLength;
         if (!validFieldPoint(x, y)) { status = "Corner reset blocked: invalid geometry"; return; }
-        Pose reset = new Pose(x, y, Math.toRadians(heading));
+
+        if (applyPoseReset(new Pose(x, y, Math.toRadians(heading)))) {
+            status = (red ? "RED " : "BLUE ") + (upper ? "UPPER" : "LOWER") + " corner reset";
+        }
+    }
+
+    /**
+     * Shared by both resets: stop everything, set the pose, re-pick the goal.
+     * Returns false if the Pinpoint rejected the new pose (I2C fault).
+     */
+    private boolean applyPoseReset(Pose reset) {
         shooterActive = false;
+        shooterIdle = false;
         outtake.setTargetTPS(0.0);
         stopFeederOnly();
         intake.stopIntake();
-        //robotSettings.block();
         follower.manual(new DrivePowers(0.0, 0.0, 0.0));
-        follower.setPose(reset);
+        poseResetThisLoop = true;
+        try {
+            follower.setPose(reset);
+        } catch (RuntimeException e) {
+            odometryErrorCount++;
+            lastOdometryError = e.getClass().getSimpleName();
+            RobotLog.ee(logTag, e, "follower.setPose() failed during reset");
+            status = "Reset failed: odometry not responding";
+            return false;
+        }
         PoseStorage.setPose(reset);
         poseEstablished = true;
-        poseResetThisLoop = true;
+        headingSuspect = false;
         manualGoalMode = false;
         goalSelectionInitialized = false;
         updateGoalFromPose(reset);
         turret.realignToSelectedGoal();
-        status = (red ? "RED " : "BLUE ") + (upper ? "UPPER" : "LOWER") + " corner reset";
+        return true;
     }
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
 
     private PoseStorage.Alliance resolveAlliance() {
         if (ALLIANCE_MODE == AllianceMode.RED) return PoseStorage.Alliance.RED;
@@ -543,19 +1296,185 @@ public class CombinedTeleOp extends OpMode {
                 : activeAlliance == PoseStorage.Alliance.BLUE ? "BLUE" : "UNKNOWN";
     }
 
+    // ---------------------------------------------------------------------
+    // Driving, with odometry fallback
+    // ---------------------------------------------------------------------
+
     private void driveRobot() {
         double strafeInput = gamepad1.left_stick_x;
         double turnInput = gamepad1.right_stick_x;
         if (CUBIC_STRAFE_TURN) {
-            strafeInput = Math.pow(strafeInput, 3);
-            turnInput = Math.pow(turnInput, 3);
+            strafeInput = strafeInput * strafeInput * strafeInput;
+            turnInput = turnInput * turnInput * turnInput;
         }
-        double forward = FORWARD_SIGN * gamepad1.left_stick_y * RobotConstants.DRIVE_SPEED;
-        double strafe = STRAFE_SIGN * strafeInput * RobotConstants.DRIVE_SPEED;
-        double turn = TURN_SIGN * turnInput * RobotConstants.DRIVE_SPEED;
+        double forward = FORWARD_SIGN * gamepad1.left_stick_y * RobotConstants.driveSpeed;
+        double strafe = STRAFE_SIGN * strafeInput * RobotConstants.driveSpeed;
+        double turn = TURN_SIGN * turnInput * RobotConstants.driveSpeed;
         if (gamepad2.dpad_down || gamepad2.dpad_up) forward = strafe = turn = 0.0;
+
+        if (odometryFaulted) {
+            runFallbackDrive(forward, strafe, turn);
+            return;
+        }
+
         follower.manual(new DrivePowers(forward, strafe, turn));
-        follower.update();
+        if (timedFollowerUpdate()) {
+            consecutiveSlowUpdates = 0;
+            return;
+        }
+
+        consecutiveSlowUpdates++;
+        boolean hardFault = !lastFailureWasSlowOnly;
+        if (fallbackDriveEnabled && fallbackAvailable
+                && (hardFault || consecutiveSlowUpdates >= Math.max(1, odometrySlowLimit))) {
+            enterOdometryFallback(lastOdometryError);
+            // Pedro may not have written the drive powers; do it now
+            setDirectDrivePowers(forward, strafe, turn);
+        }
+    }
+
+    /**
+     * Runs follower.update() and reports whether it was healthy: no
+     * exception, a valid pose, and not slower than odometrySlowUpdateMs.
+     */
+    private boolean timedFollowerUpdate() {
+        followerUpdateTimer.reset();
+        try {
+            follower.update();
+        } catch (RuntimeException e) {
+            lastFollowerUpdateMs = followerUpdateTimer.milliseconds();
+            odometryErrorCount++;
+            lastOdometryError = e.getClass().getSimpleName();
+            lastFailureWasSlowOnly = false;
+            RobotLog.ee(logTag, e, "follower.update() failed (count %d)", odometryErrorCount);
+            return false;
+        }
+        lastFollowerUpdateMs = followerUpdateTimer.milliseconds();
+
+        // BBR expander: a failed read serves the last good pose instead of
+        // throwing, so check freshness. Counted like a slow update (two in a
+        // row switch to fallback) so a single missed read doesn't.
+        if (Constants.expanderLocalizer != null
+                && !Constants.expanderLocalizer.getExpander().isDataFresh()) {
+            lastOdometryError = "EXPANDER DATA STALE";
+            lastFailureWasSlowOnly = true;
+            RobotLog.ww(logTag, "Expander localizer data not fresh");
+            return false;
+        }
+
+        // BBR expander: if the localizer has left RUNNING the pose has
+        // stopped updating, so don't aim or drive paths with it.
+        if (Constants.expanderLocalizer != null
+                && !Constants.expanderLocalizer.isRunning()) {
+            odometryErrorCount++;
+            BBRDigitalExpander.LocalizerState st =
+                    Constants.expanderLocalizer.getLastState();
+            lastOdometryError = "EXPANDER " + (st == null ? "NO DATA" : String.valueOf(st.status));
+            lastFailureWasSlowOnly = false;
+            RobotLog.ww(logTag, "Expander localizer not RUNNING: %s", lastOdometryError);
+            return false;
+        }
+
+        if (!validPose(follower.pose())) {
+            odometryErrorCount++;
+            lastOdometryError = "INVALID POSE";
+            lastFailureWasSlowOnly = false;
+            RobotLog.ww(logTag, "follower.update() gave an invalid pose");
+            return false;
+        }
+
+        if (lastFollowerUpdateMs > odometrySlowUpdateMs) {
+            lastOdometryError = String.format("SLOW %.0f ms", lastFollowerUpdateMs);
+            lastFailureWasSlowOnly = true;
+            RobotLog.ww(logTag, "follower.update() slow: %.0f ms", lastFollowerUpdateMs);
+            return false;
+        }
+        return true;
+    }
+
+    private void enterOdometryFallback(String reason) {
+        if (!fallbackAvailable) return;
+        odometryFaulted = true;
+        odometryDropoutCount++;
+        consecutiveGoodProbes = 0;
+        odometryRetryTimer.reset();
+
+        // Pose is no longer being tracked: stop trusting it
+        poseEstablished = false;
+        targetValid = false;
+        stopFeederOnly();
+        lockTurretCentre();
+
+        if (controllerFeedback) {
+            gamepad1.rumble(1000);
+            gamepad2.rumble(1000);
+        }
+
+        status = "ODOMETRY OFFLINE (" + reason + "): driving direct, turret centred";
+        RobotLog.ww(logTag, "Odometry fallback ON (%s), dropout %d", reason, odometryDropoutCount);
+    }
+
+    /**
+     * Drives the wheels directly, and every odometryRetryIntervalMs tests
+     * whether the Pinpoint is answering again. Once it gives
+     * odometryRecoverCount good updates in a row, Pedro takes over again.
+     */
+    private void runFallbackDrive(double forward, double strafe, double turn) {
+        if (!forceFallbackDrive
+                && odometryRetryTimer.milliseconds() >= odometryRetryIntervalMs) {
+            // Give Pedro the same powers so a probe update can't jerk the robot
+            follower.manual(new DrivePowers(forward, strafe, turn));
+            if (timedFollowerUpdate()) {
+                consecutiveGoodProbes++;
+                // keep probing every loop while it looks healthy
+                if (consecutiveGoodProbes >= Math.max(1, odometryRecoverCount)) {
+                    exitOdometryFallback();
+                    return;   // Pedro just wrote this loop's powers
+                }
+            } else {
+                consecutiveGoodProbes = 0;
+                odometryRetryTimer.reset();
+            }
+        }
+        setDirectDrivePowers(forward, strafe, turn);
+    }
+
+    private void exitOdometryFallback() {
+        odometryFaulted = false;
+        consecutiveSlowUpdates = 0;
+        consecutiveGoodProbes = 0;
+        // Turret stays centred (poseEstablished is false) until the drivers
+        // do a corner reset; updateShootingMode() then restores auto aim.
+        if (controllerFeedback) {
+            gamepad1.rumbleBlips(2);
+            gamepad2.rumbleBlips(2);
+        }
+        status = "Odometry back: corner reset to restore auto aim + regression";
+        RobotLog.ii(logTag, "Odometry fallback OFF, Pedro driving again");
+    }
+
+    /**
+     * Robot-centric mecanum mix in Pedro's convention:
+     * forward +, strafe + = left, turn + = counter-clockwise.
+     */
+    private void setDirectDrivePowers(double forward, double strafe, double turn) {
+        if (!fallbackAvailable) return;
+        double s = strafe * (Double.isFinite(fallbackStrafeSign) ? fallbackStrafeSign : 1.0);
+        double t = turn * (Double.isFinite(fallbackTurnSign) ? fallbackTurnSign : 1.0);
+
+        double frontLeftPower = forward - s - t;
+        double backLeftPower = forward + s - t;
+        double frontRightPower = forward + s + t;
+        double backRightPower = forward - s + t;
+
+        double max = Math.max(1.0, Math.max(
+                Math.max(Math.abs(frontLeftPower), Math.abs(backLeftPower)),
+                Math.max(Math.abs(frontRightPower), Math.abs(backRightPower))));
+
+        frontLeft.setPower(frontLeftPower / max);
+        backLeft.setPower(backLeftPower / max);
+        frontRight.setPower(frontRightPower / max);
+        backRight.setPower(backRightPower / max);
     }
 
     private void clearBulkCache() {
@@ -572,31 +1491,90 @@ public class CombinedTeleOp extends OpMode {
                 && x >= 0.0 && y >= 0.0 && x <= FIELD_SIZE_IN && y <= FIELD_SIZE_IN;
     }
 
+    // ---------------------------------------------------------------------
+    // Telemetry
+    // ---------------------------------------------------------------------
+
+    /** Builds telemetry only every telemetryIntervalMs; formatting is slow. */
+    private void maybeDisplayTelemetry() {
+        if (telemetryTimer.milliseconds() < telemetryIntervalMs) return;
+        telemetryTimer.reset();
+        displayTelemetry();
+    }
+
     private void displayTelemetry() {
         Pose pose = follower == null ? null : follower.pose();
         telemetry.addLine("=== STATUS ===");
         telemetry.addData("Status", status);
+        telemetry.addData("Drive Mode", odometryFaulted
+                ? "FALLBACK - odometry offline, turret locked centre"
+                : "PEDRO");
+        telemetry.addData("Shooting Mode", autoAimMode
+                ? "AUTO AIM + LUT REGRESSION"
+                : "FIXED TURRET + FIXED TPS (" + fixedReason + ")");
+        telemetry.addData("Loop", "%.1f ms (avg %.1f, %.0f Hz)",
+                loopMs, avgLoopMs, avgLoopMs > 0.0 ? 1000.0 / avgLoopMs : 0.0);
+        telemetry.addData("Max Loop / Slow", "%.0f ms / %d", maxLoopMs, slowLoopCount);
+        if (loopProfilerEnabled) {
+            telemetry.addData("Bulk read ms", bulkTimingText);
+            telemetry.addData("Loop ms", "ctrl %.0f | drive %.0f | aim %.0f | outtake %.0f"
+                            + " | feed %.0f | display %.0f | sdk %.0f",
+                    controlsMs, driveMs, aimMs, outtakeMs, feedMs, displayMs,
+                    Math.max(0.0, loopMs - loopBodyMs));
+        }
+        telemetry.addData("Odometry", "%s | update %.0f ms | errors %d | dropouts %d | last: %s",
+                Constants.useExpanderLocalizer ? "EXPANDER" : "PINPOINT",
+                lastFollowerUpdateMs, odometryErrorCount, odometryDropoutCount, lastOdometryError);
+        if (!fallbackAvailable) telemetry.addLine("WARNING: fallback drive motors not found");
+        if (headingSuspect) telemetry.addLine("HEADING SUSPECT (hit clipped gyro): corner reset or G2 D-pad right");
+        else if (gyroSaturationSeen) telemetry.addLine("Gyro clipped earlier this match (heading re-set since)");
         telemetry.addData("Alliance", activeAlliance);
         telemetry.addData("Pose Established", poseEstablished);
         if (validPose(pose)) telemetry.addData("Pose", "(%.2f, %.2f, %.1f deg)",
                 pose.x(), pose.y(), normalizeDegrees0To360(Math.toDegrees(pose.heading())));
 
         telemetry.addLine("=== SHOOTER / FEEDER ===");
-        telemetry.addData("Shooter", shooterActive ? "ON" : "OFF");
+        telemetry.addData("Shooter", shooterActive ? "FULL"
+                : shooterIdle ? String.format("IDLE (%.0f%%)", collectIdleFraction * 100.0)
+                  : "OFF");
+        telemetry.addData("4th Ball Slot", "%s%s%s",
+                intake.isBallConfirmed() ? "FULL" : "empty",
+                !autoSpinUpEnabled ? " (auto spin-up off)"
+                        : autoSpinUpArmed ? "" : " (spin-up not armed: slot not seen empty yet)",
+                "");
+        telemetry.addData("Ball Sensor", "raw %s -> %s (triggeredWhenHigh %s)",
+                Intake.rawSensorState ? "HIGH" : "LOW",
+                Intake.sensorTriggered ? "BALL" : "none",
+                Intake.sensorTriggeredWhenHigh);
+        telemetry.addData("Regression", "%s (%s)",
+                Outtake.DISTANCE_REGRESSION_ENABLED ? "ON" : "OFF",
+                outtake.getRegressionStatus());
         telemetry.addData("TPS", "%.0f / %.0f", outtake.getCurrentTPS(), outtake.getTargetTPS());
-        telemetry.addData("At Speed", outtake.isAtSpeed(RobotConstants.FEED_SPEED_TOLERANCE_TPS));
+        telemetry.addData("Hood", "%.3f (%s)", outtake.getHoodPosition(),
+                outtake.isUsingDistanceRegression() ? "from lookup table" : "fixed");
+        telemetry.addData("Fixed TPS", "%.0f (base %.0f, offset %+.0f)",
+                RobotConstants.outtakeTps + shooterTpsOffset,
+                RobotConstants.outtakeTps, shooterTpsOffset);
+        telemetry.addData("At Speed", outtake.isAtSpeed(RobotConstants.feedSpeedToleranceTps));
         telemetry.addData("Raw / Filtered TPS", "%.0f / %.0f", outtake.getRawTPS(), outtake.getCurrentTPS());
-        //telemetry.addData("Shooter Power", "%.3f (integral %.3f, voltage scale %.2f)",
-        //telemetry.addData("Regression", "%s | fixed target %.0f",
-        telemetry.addData("Feeder Requested", feederRequested);
-        telemetry.addData("Feeder Permitted", feederPermitted);
+        telemetry.addData("Feeder", "%s (burst %s, gate %s)",
+                feederPermitted ? "ON" : "OFF",
+                burstActive ? "active" : "idle",
+                gateOpen ? "open" : "closed");
         telemetry.addData("Feeder Status", feederBlockReason);
+        telemetry.addData("Fire Delay", "%.0f ms (waited on: %s)",
+                lastFireDelayMs, lastFireWaitReason);
         telemetry.addData("Fixed Override", fixedTurretFeedOverride);
 
         telemetry.addLine("=== TURRET ===");
         String turretState;
-        if (!autoAimMode) {
-            turretState = "FIXED (auto aim off - press G1 Square)";
+        if (turret.isVisionOnlyAim()) {
+            turretState = "VISION ONLY (" + fixedReason + ")"
+                    + (turret.isVisionOnTarget() ? " - ON TARGET" : "");
+        } else if (odometryFaulted) {
+            turretState = "LOCKED CENTRE (odometry offline)";
+        } else if (!autoAimMode) {
+            turretState = "LOCKED CENTRE (" + fixedReason + ")";
         } else if (!targetValid || !poseEstablished) {
             turretState = "NO TARGET/POSE - turret centred";
         } else if (turret.isTargetReachable()) {
@@ -608,6 +1586,13 @@ public class CombinedTeleOp extends OpMode {
         telemetry.addData("Turret State", turretState);
         telemetry.addData("Auto Aim", autoAimMode);
         telemetry.addData("Aim Source", turret.getAimSource());
+        if (visionAvailable) {
+            telemetry.addData("Vision", "%s | bearing %.1f | correction %.1f deg | %s | %.0f ms",
+                    Turret.lastVisionStatus, Turret.lastVisionBearingDeg,
+                    Turret.lastVisionCorrectionDeg, LimelightCam.cameraStatus, visionMs);
+        } else {
+            telemetry.addData("Vision", visionEnabled ? "LIMELIGHT NOT FOUND" : "OFF");
+        }
         telemetry.addData("Aim Ready", turret.isAimReady());
         telemetry.addData("Goal", "%s %s (%s)",
                 allianceLabel(),
@@ -625,12 +1610,19 @@ public class CombinedTeleOp extends OpMode {
 
         telemetry.addLine("=== CONTROLS ===");
         telemetry.addLine("G1 Cross: shooter on | Triangle: off");
-        telemetry.addLine("G1 RT: feed immediately");
-        telemetry.addLine("G1 RB: collect / shooter off");
-        telemetry.addLine("G1 Square: auto aim");
-        telemetry.addLine("G2 Square: centre / fixed shooting");
+        telemetry.addLine("G1 RT: hold to fire | LB: reverse intake");
+        telemetry.addLine(shooterOffWhileCollecting
+                ? "G1 RB: collect / shooter off (auto-starts on release if full)"
+                : "G1 RB: collect / shooter idles (full on release if 4 balls)");
+        telemetry.addLine("G1 RT also spins the shooter up | Triangle: shooter fully off");
+        if (allowManualRegressionToggle) telemetry.addLine("G1 Circle: regression on/off");
+        if (allowManualFixedShooting) {
+            telemetry.addLine("G2 Square: force fixed shooting | G1 Square: back to auto");
+        }
         telemetry.addLine("G2 Cross/Circle/Triangle: lower/upper/auto goal");
         telemetry.addLine("G2 D-pad up/down: corner reset");
+        telemetry.addLine("G2 D-pad right: heading snap (square against any wall)");
+        telemetry.addLine("G2 LB/RB: fixed TPS -/+ | D-pad left: clear offset");
         telemetry.update();
     }
 
@@ -639,16 +1631,19 @@ public class CombinedTeleOp extends OpMode {
         return result < 0.0 ? result + 360.0 : result;
     }
 
+    /**
+     * Keep stop() short and free of I2C reads. The SDK zeroes every motor
+     * when the OpMode stops, so there's no need to call follower.update().
+     */
     @Override
     public void stop() {
+        RobotLog.ii(logTag, "TeleOp stopping. Max loop %.0f ms, slow loops %d, "
+                        + "odometry errors %d, dropouts %d",
+                maxLoopMs, slowLoopCount, odometryErrorCount, odometryDropoutCount);
         if (outtake != null) outtake.stopOuttake();
         if (intake != null) intake.stopIntake();
-        //if (robotSettings != null) robotSettings.block();
         if (turret != null) turret.setCentre();
-        if (follower != null) {
-            follower.manual(new DrivePowers(0.0, 0.0, 0.0));
-            follower.update();
-        }
+        if (limelightCam != null) limelightCam.close();
         if (hubs != null) for (LynxModule hub : hubs)
             hub.setBulkCachingMode(LynxModule.BulkCachingMode.AUTO);
     }
