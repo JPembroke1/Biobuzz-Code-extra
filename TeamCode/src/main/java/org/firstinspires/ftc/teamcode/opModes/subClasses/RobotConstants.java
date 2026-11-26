@@ -15,6 +15,9 @@ public class RobotConstants {
     public static double frontFeedSpeed = 1.0;
     public static double backFeedSpeed = 1.0;
 
+    public static double frontFeedSpeedAuto = 1.0;
+    public static double backFeedSpeedAuto = 1.0;
+
 
     // -------------------------------------------------------------------------
     // Turret
@@ -38,7 +41,7 @@ public class RobotConstants {
     // time TeleOp starts, and G2 D-pad left clears it.
     // -------------------------------------------------------------------------
 
-    public static double outtakeTps = 1950.0;
+    public static double outtakeTps = 1940.0;
     public static double outtakeTpsStep = 20.0;
 
 

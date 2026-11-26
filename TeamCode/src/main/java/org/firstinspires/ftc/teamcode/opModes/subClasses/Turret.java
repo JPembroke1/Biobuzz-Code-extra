@@ -127,7 +127,7 @@ public class Turret {
     // velocityX and velocityY must be field-frame velocities in inches/s.
     // ---------------------------------------------------------------------
 
-    public static boolean velocityCompensationActive = false;
+    public static boolean velocityCompensationActive = true;
     public static double VELOCITY_LEAD_GAIN = 0.3;
 
     // ---------------------------------------------------------------------
@@ -697,6 +697,12 @@ public class Turret {
                 robotPose,
                 calculation
         );
+    }
+
+    public void ShootOnTheMove(double RobotX, double RobotY, double RobotHeading, double VelocityX, double VelocityY) {
+        Pose robotPose = new Pose(RobotX, RobotY, RobotHeading);
+        aimTurret(robotPose, VelocityX, VelocityY);
+
     }
 
     // ---------------------------------------------------------------------

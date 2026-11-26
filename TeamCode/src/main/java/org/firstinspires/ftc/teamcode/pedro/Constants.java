@@ -24,7 +24,7 @@ public class Constants {
      *   true  = BBR Digital Expander (settings are in BBRExpanderLocalizer)
      *   false = goBILDA Pinpoint (localizerConfig below), the old setup
      */
-    public static boolean useExpanderLocalizer = true;
+    public static boolean useExpanderLocalizer = false;
 
     /*
      * The expander localizer created by the last create() call, or null when
@@ -50,10 +50,10 @@ public class Constants {
         c.frontRightName.set("frontRight");
         c.backLeftName.set("backLeft");
         c.backRightName.set("backRight");
-        c.frontLeftDirection.set(DcMotorSimple.Direction.REVERSE);
-        c.frontRightDirection.set(DcMotorSimple.Direction.FORWARD);
-        c.backLeftDirection.set(DcMotorSimple.Direction.REVERSE);
-        c.backRightDirection.set(DcMotorSimple.Direction.FORWARD);
+        c.frontLeftDirection.set(DcMotorSimple.Direction.FORWARD);
+        c.frontRightDirection.set(DcMotorSimple.Direction.REVERSE);
+        c.backLeftDirection.set(DcMotorSimple.Direction.FORWARD);
+        c.backRightDirection.set(DcMotorSimple.Direction.REVERSE);
     });
 
     public static ForesightConfig foresightConfig = new ForesightConfig(

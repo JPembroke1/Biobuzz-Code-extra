@@ -25,63 +25,6 @@ import org.firstinspires.ftc.teamcode.pedro.Constants;
 
 import java.util.List;
 
-/**
- * Combined TeleOp, Pinpoint-only turret aiming (no camera).
- *
- * Goal naming: the "upper" and "lower" goals here are the two goals at
- * different field Y positions. In Turret they map to the per-goal angle
- * trims:
- *
- *   UPPER goal -> Turret.HIGH_GOAL_ANGLE_TRIM_DEG
- *   LOWER goal -> Turret.LOW_GOAL_ANGLE_TRIM_DEG
- *
- * The goal coordinates themselves are the RED_/BLUE_ UPPER/LOWER fields
- * in this class. The Turret's own RED_LOW_GOAL_X/Y style coordinate
- * fields are not used by this TeleOp.
- *
- * Feeding: the safety checks (shooter on, aim, regression, at speed) are
- * made once when the right trigger starts a burst. While the trigger stays
- * held the burst keeps going, so the flywheel dipping after each ball does
- * not stop and restart the feed. Set checkOnlyAtBurstStart = false to
- * go back to checking every loop.
- *
- * Robustness (disconnect investigation):
- *  1. stop() does not call follower.update(). That reads the Pinpoint over
- *     I2C and can block stop() if the bus has faulted, which makes the SDK
- *     restart the robot. The SDK zeroes all motors on stop anyway.
- *  2. Slow loops are written to the robot log and the worst loop time is
- *     shown in telemetry.
- *  3. ODOMETRY FALLBACK. If follower.update() throws, returns an invalid
- *     pose, or is repeatedly slow (Pinpoint I2C fault after a hit), the
- *     TeleOp stops using Pedro and drives the four wheels directly, so the
- *     robot keeps driving. While in fallback:
- *       - the turret is locked to centre and auto aim is off;
- *       - fixed-turret shooting stays available (fixed TPS, no regression);
- *       - corner resets are blocked (the pose is not being tracked).
- *     It probes the Pinpoint every odometryRetryIntervalMs and returns to
- *     Pedro after odometryRecoverCount good updates in a row. The turret
- *     stays centred after recovery until a corner reset re-establishes the
- *     pose; auto aim and regression then come back by themselves.
- *
- * Shooting mode (see updateShootingMode):
- *   NORMAL  = auto aim + lookup-table distance regression. This is the
- *             default whenever the pose is good.
- *   FIXED   = turret locked centre + fixed TPS (RobotConstants.outtakeTps).
- *             Used only when there is no trustworthy distance: odometry
- *             offline (Pinpoint fault), or no pose yet (do a corner reset).
- *             The manual G2 Square / G1 Circle overrides are off by default
- *             (allowManualFixedShooting, allowManualRegressionToggle).
- *
- * Limelight (on the turret): odometry gives the coarse aim; when the goal
- * cluster is visible its bearing corrects the aim (Turret "Vision
- * correction"). With odometry offline or no pose, the turret aims from the
- * camera alone (VISION ONLY) at fixed TPS, and feeding waits until the
- * camera says it's on target. If the Limelight is missing, everything
- * works as before.
- *
- * The four drive motor names below match drivetrainConfig in pedro/Constants.java;
- * test the fallback on blocks (see fallbackStrafeSign / fallbackTurnSign).
- */
 @Configurable
 @TeleOp(name = "0. Combined TeleOp", group = "Main")
 public class CombinedTeleOp extends OpMode {
@@ -403,7 +346,7 @@ public class CombinedTeleOp extends OpMode {
 
         Outtake.DISTANCE_REGRESSION_ENABLED = REGRESSION_ON_AT_START;
         Outtake.HOOD_COMP_ENABLED = false;
-        Turret.velocityCompensationActive = false;
+        Turret.velocityCompensationActive = true;
         turret.setCentre();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         robotSettings.block();

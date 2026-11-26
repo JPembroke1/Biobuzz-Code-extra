@@ -51,6 +51,19 @@ import java.util.List;
  *  5. Limelight fine aim on each shot (same as the other autos), with a short
  *     timeout so it never costs more than visionAimTimeoutSeconds.
  *
+ * Shooting (26 Nov 2026): the same aiming and regression as the TeleOp.
+ *  - POSE AIM: for each shot the turret aims from odometry at the red goal
+ *    (goal coordinates and upper/lower switch taken from CombinedTeleOp, so
+ *    there is one place to tune them), with the Limelight correcting the aim
+ *    when the goal cluster is in view (Turret "vision correction").
+ *    If the pose is bad or the goal is outside the turret's arc, the shot
+ *    falls back to its preset position + Limelight fine aim, as before.
+ *  - LUT REGRESSION: the flywheel speed and hood come from the Outtake
+ *    lookup table, using the distance from the turret to the goal. The
+ *    distance is sent every loop, so the flywheel is already near the right
+ *    speed when the robot arrives. Outside the table it clamps (Outtake
+ *    CLAMP_DISTANCE_TO_RANGE); with no valid distance it uses outtakeTps.
+ *
  * Tune it back toward the old values if anything gets unreliable. The things
  * most likely to need it: FLOWER_FEED_SECONDS (all balls out?), the hold
  * times (all pollen in?) and DRIVE_SPEED on paths 4/6 (heading wobble).
@@ -73,7 +86,7 @@ public class FlowerRedAutoFast extends OpMode {
 
     // Route / mechanism values unchanged from the supplied auto unless marked CHANGED.
     public static double PRELOAD_TURRET_POSITION = 0.0;
-    public static double FAR_WALL_TURRET_POSITION = 0.40;
+    public static double FAR_WALL_TURRET_POSITION = 0.20;
     public static double SECOND_FLOWER_TURRET_POSITION = 0.45;
     public static double TRAVEL_TURRET_POSITION = 0.50;
     public static double AUTO_TURRET_TRIM = 0.0;
@@ -87,8 +100,8 @@ public class FlowerRedAutoFast extends OpMode {
     public static double PARK_SPEED = 1.00;
 
     public static double TURRET_SETTLE_SECONDS = 0.15;        // was 0.20
-    public static double SHOOT_READY_TIMEOUT_SECONDS = 0.70;  // was 1.0
-    public static double BLOCK_RELEASE_SECONDS = 0.25;        // was 0.40
+    public static double SHOOT_READY_TIMEOUT_SECONDS = 1.0;  // was 1.0
+    public static double BLOCK_RELEASE_SECONDS = 0.35;        // was 0.40
     public static double PRELOAD_FEED_SECONDS = 0.80;         // was 1.00
     public static double FLOWER_FEED_SECONDS = 1.30;          // was 1.60
 
@@ -110,13 +123,25 @@ public class FlowerRedAutoFast extends OpMode {
     public static boolean useVisionAim = true;
     public static double visionAimTimeoutSeconds = 0.40;
 
+    // Shot aiming from odometry (+ Limelight correction) instead of fixed presets.
+    public static boolean usePoseAim = true;
+    // Flywheel speed + hood from the Outtake lookup table (distance to goal).
+    public static boolean useLutRegression = true;
+    // Longest a shot waits for the pose aim (turret settled, Limelight locked) before firing.
+    public static double poseAimMaxWaitSeconds = 0.60;
+    // Sanity check on the pose aim. Your presets are tuned and known good, so if the odometry
+    // aim disagrees with a shot's preset by more than this AND the Limelight hasn't confirmed
+    // the goal, the odometry pose is probably off (drift after pickups / pass-throughs): the
+    // shot uses its preset + Limelight fine aim instead. A Limelight lock always wins.
+    public static double poseAimMaxDeviationDeg = 10.0;
+
     public static double TPS_READY_FRACTION = 0.95;
 
     public static double PATH1_TIMEOUT_SECONDS = 4.0;
     public static double PATH2_TIMEOUT_SECONDS = 3.0;
     public static double PATH3_TIMEOUT_SECONDS = 3.0;
     public static double PATH4_TIMEOUT_SECONDS = 5.0;
-    public static double PATH5_TIMEOUT_SECONDS = 5.0;
+    public static double PATH5_TIMEOUT_SECONDS = 1.5;
     public static double PATH6_TIMEOUT_SECONDS = 4.0;
     public static double PATH7_TIMEOUT_SECONDS = 2.5;
     public static double PATH8_TIMEOUT_SECONDS = 5.0;
@@ -184,6 +209,16 @@ public class FlowerRedAutoFast extends OpMode {
     private boolean visionLocked = false;
     private String lastVisionShot = "NONE";
     private String lastPassThroughPath = "NONE";
+
+    // Pose aim + regression state
+    private boolean poseAimThisShot = false;   // this shot is aiming from odometry
+    private double shotPresetPosition = 0.5;   // fallback if pose aim isn't possible
+    private boolean upperGoalSelected = false;
+    private boolean goalInitialised = false;
+    private double goalX = Double.NaN;
+    private double goalY = Double.NaN;
+    private double distanceToGoalIn = Double.NaN;
+    private String lastAimShot = "NONE";
 
     // Route coordinates intentionally unchanged.
     private final Pose start = poseFactory.of(52.3532, 8.0, 180.0);
@@ -438,10 +473,13 @@ public class FlowerRedAutoFast extends OpMode {
         initLimelight();
 
         Turret.velocityCompensationActive = false;
+        Outtake.DISTANCE_REGRESSION_ENABLED = useLutRegression;
         intake.stopIntake();
         outtake.stopOuttake();
         robotSettings.block();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
+
+        setFixedTurretPosition(PRELOAD_TURRET_POSITION);
 
         resetRuntimeState();
         setTravelTurretPosition();
@@ -475,7 +513,6 @@ public class FlowerRedAutoFast extends OpMode {
         PoseStorage.setPose(start);
         resetRuntimeState();
         stopIntakeAndBlock();
-        setTravelTurretPosition();
         if (spinUpAtStart) outtake.setTargetTPS(RobotConstants.outtakeTps);
         lastLoopTime = getRuntime();
         schedule(autoRoutine());
@@ -495,10 +532,13 @@ public class FlowerRedAutoFast extends OpMode {
         Pose currentPose = follower.pose();
         if (currentPose != null) PoseStorage.setPose(currentPose);
 
+        updateGoal(currentPose);
         updateVision();
-        updateTurret();
+        updateTurret(currentPose);
         intake.update();
         outtake.setHoodPosition(RobotConstants.hoodPosition);
+        // Lookup table: needs a fresh distance every loop (Outtake DISTANCE_TIMEOUT_SECONDS)
+        outtake.setGoalDistance(useLutRegression ? distanceToGoalIn : Double.NaN);
         outtake.update();
 
         // Throttled: building and sending ~60 telemetry lines every loop skews loop timing.
@@ -631,7 +671,17 @@ public class FlowerRedAutoFast extends OpMode {
 
     private void beginShot(double turretPosition, double feedSeconds) {
         shotCount++;
-        setFixedTurretPosition(turretPosition);
+        shotPresetPosition = turretPosition;
+        // Each shot measures its own Limelight correction: one carried over from a shot at a
+        // different spot (held up to visionHoldMs + visionFadeMs) would point this one wrong.
+        turret.clearVisionCorrection();
+        poseAimThisShot = usePoseAim && canPoseAim(follower.pose());
+        if (poseAimThisShot) {
+            // The turret is about to move to the aimed angle: time the settle from now.
+            turretMoveTime = getRuntime();
+        } else {
+            setFixedTurretPosition(turretPosition);
+        }
         outtake.setTargetTPS(RobotConstants.outtakeTps);
         startShooterReadyWait();
         stopIntakeAndBlock();
@@ -653,7 +703,7 @@ public class FlowerRedAutoFast extends OpMode {
 
         if (shootPhase == ShootPhase.WAIT) {
             boolean turretSettled = now - turretMoveTime >= TURRET_SETTLE_SECONDS
-                    && visionAimDone(now);
+                    && (poseAimThisShot ? poseAimDone(now) : visionAimDone(now));
             if (turretSettled
                     && (isShooterAtFraction(PRE_RELEASE_TPS_FRACTION)
                     || shooterReadyOrTimedOut())) {
@@ -703,8 +753,8 @@ public class FlowerRedAutoFast extends OpMode {
     private void runShootFeed() {
         robotSettings.release();
         intake.intake(
-                RobotConstants.frontFeedSpeed,
-                RobotConstants.backFeedSpeed
+                RobotConstants.frontFeedSpeedAuto,
+                RobotConstants.backFeedSpeedAuto
         );
         outtake.setFeederOn(true);
     }
@@ -820,13 +870,112 @@ public class FlowerRedAutoFast extends OpMode {
                 && getRuntime() - turretMoveTime >= TURRET_SETTLE_SECONDS;
     }
 
-    private void updateTurret() {
+    private void updateTurret(Pose pose) {
+        boolean aiming = shootPhase == ShootPhase.WAIT || shootPhase == ShootPhase.RELEASE;
+
+        // Pose aim (odometry + Limelight correction) during the shot's WAIT/RELEASE
+        if (aiming && poseAimThisShot) {
+            String why = "pose lost";
+            if (canPoseAim(pose)) {
+                turret.aimTurret(pose);
+                boolean visionConfirmed = turret.isVisionTargetVisible()
+                        && "LOCKED".equals(Turret.lastVisionStatus);
+                double deviation = Math.abs(Turret.lastFinalAngleDeg
+                        - presetAngleDeg(shotPresetPosition));
+                if (!turret.isTargetReachable()) {
+                    why = "goal outside turret arc";
+                } else if (!visionConfirmed && deviation > poseAimMaxDeviationDeg) {
+                    why = String.format("pose aim %.0f deg off preset, no camera lock", deviation);
+                } else {
+                    return;
+                }
+            }
+            // Fall back to the preset (+ Limelight fine aim below)
+            poseAimThisShot = false;
+            setFixedTurretPosition(shotPresetPosition);
+            lastAimShot = String.format("shot %d: PRESET (%s) at (%.1f, %.1f, %.0f deg)",
+                    shotCount, why,
+                    pose == null ? Double.NaN : pose.x(),
+                    pose == null ? Double.NaN : pose.y(),
+                    pose == null ? Double.NaN : Math.toDegrees(pose.heading()));
+        }
+
         if (visionWindowOpen() && (visionLocked || turret.isVisionTargetVisible())) {
             visionLocked = true;
             turret.aimVisionOnly();
         } else {
             turret.setFixedServoPosition(activeTurretPosition);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Goal, distance and pose aim (same goal coordinates as CombinedTeleOp)
+    // ---------------------------------------------------------------------------------------
+
+    private static boolean validPose(Pose pose) {
+        return pose != null && Double.isFinite(pose.x()) && Double.isFinite(pose.y())
+                && Double.isFinite(pose.heading());
+    }
+
+    /**
+     * Picks the red upper/lower goal from the robot's Y (with the TeleOp's hysteresis), hands
+     * it to the turret, and works out the turret-to-goal distance for the lookup table.
+     */
+    private void updateGoal(Pose pose) {
+        distanceToGoalIn = Double.NaN;
+        if (!validPose(pose)) return;
+
+        double y = pose.y();
+        double hyst = Math.max(0.0, CombinedTeleOp.GOAL_HYSTERESIS_IN);
+        if (!goalInitialised) upperGoalSelected = y >= CombinedTeleOp.GOAL_SWITCH_Y_IN;
+        else if (upperGoalSelected && y < CombinedTeleOp.GOAL_SWITCH_Y_IN - hyst) upperGoalSelected = false;
+        else if (!upperGoalSelected && y >= CombinedTeleOp.GOAL_SWITCH_Y_IN + hyst) upperGoalSelected = true;
+        goalInitialised = true;
+
+        double gx = upperGoalSelected ? CombinedTeleOp.RED_UPPER_GOAL_X : CombinedTeleOp.RED_LOWER_GOAL_X;
+        double gy = upperGoalSelected ? CombinedTeleOp.RED_UPPER_GOAL_Y : CombinedTeleOp.RED_LOWER_GOAL_Y;
+        if (!Double.isFinite(gx) || !Double.isFinite(gy)) return;
+
+        turret.setGoalHeight(upperGoalSelected ? Turret.GoalHeight.HIGH : Turret.GoalHeight.LOW);
+        if (Double.compare(gx, goalX) != 0 || Double.compare(gy, goalY) != 0) {
+            goalX = gx;
+            goalY = gy;
+            turret.setTargetPose(new Pose(goalX, goalY, 0.0));
+            turret.realignToSelectedGoal();
+        }
+
+        // Distance from the turret pivot, as in the TeleOp
+        double h = pose.heading();
+        double pivotX = pose.x() + Turret.TURRET_OFFSET_X_IN * Math.cos(h)
+                - Turret.TURRET_OFFSET_Y_IN * Math.sin(h);
+        double pivotY = pose.y() + Turret.TURRET_OFFSET_X_IN * Math.sin(h)
+                + Turret.TURRET_OFFSET_Y_IN * Math.cos(h);
+        distanceToGoalIn = Math.hypot(goalX - pivotX, goalY - pivotY);
+    }
+
+    private boolean canPoseAim(Pose pose) {
+        return validPose(pose) && Double.isFinite(goalX) && Double.isFinite(goalY);
+    }
+
+    /** Turret angle (deg, Turret's convention) that a preset servo position points at. */
+    private static double presetAngleDeg(double presetPosition) {
+        double pos = presetPosition + AUTO_TURRET_TRIM;
+        double sign = Turret.REVERSE_AIM_MAPPING ? -1.0 : 1.0;
+        return sign * (pos - Turret.getCalibratedCentrePosition()) * Turret.SERVO_RANGE_DEG;
+    }
+
+    /**
+     * Pose-aimed shot may fire once the turret has settled on its aimed angle and, if the
+     * Limelight can see the goal, has applied at least one correction. Capped at
+     * poseAimMaxWaitSeconds so a bad view can't stall the auto.
+     */
+    private boolean poseAimDone(double now) {
+        if (now - shootStartTime >= poseAimMaxWaitSeconds) return true;
+        if (!turret.isTurretSettled()) return false;
+        if (useVisionAim && visionAvailable && turret.isVisionTargetVisible()) {
+            return "LOCKED".equals(Turret.lastVisionStatus);
+        }
+        return true;
     }
 
     private boolean visionAimDone(double now) {
@@ -837,6 +986,19 @@ public class FlowerRedAutoFast extends OpMode {
 
     /** At feed start, hold the turret exactly where vision put it. */
     private void freezeVisionAim() {
+        if (poseAimThisShot) {
+            activeTurretPosition = Turret.lastServoPosition;   // no turretMoveTime change
+            Pose p = follower.pose();
+            lastAimShot = String.format(
+                    "shot %d: POSE %.3f (preset %.3f), vision %+.1f deg, %.0f in, at (%.1f, %.1f, %.0f deg)",
+                    shotCount, activeTurretPosition, shotPresetPosition,
+                    Turret.lastVisionCorrectionDeg, distanceToGoalIn,
+                    p == null ? Double.NaN : p.x(), p == null ? Double.NaN : p.y(),
+                    p == null ? Double.NaN : Math.toDegrees(p.heading()));
+            poseAimThisShot = false;
+            visionLocked = false;
+            return;
+        }
         if (visionLocked) {
             activeTurretPosition = Turret.lastServoPosition;   // no turretMoveTime change
             lastVisionShot = String.format("shot %d: %.3f (%s)", shotCount,
@@ -877,6 +1039,10 @@ public class FlowerRedAutoFast extends OpMode {
         visionLocked = false;
         lastVisionShot = "NONE";
         lastPassThroughPath = "NONE";
+        poseAimThisShot = false;
+        goalInitialised = false;
+        goalX = goalY = distanceToGoalIn = Double.NaN;
+        lastAimShot = "NONE";
     }
 
     private void displayTelemetry(Pose currentPose) {
@@ -933,9 +1099,14 @@ public class FlowerRedAutoFast extends OpMode {
         telemetry.addData("Far Wall Position", "%.3f", FAR_WALL_TURRET_POSITION);
         telemetry.addData("Servo Position", "%.3f", Turret.lastServoPosition);
         telemetry.addData("Fixed Mode", Turret.lastFixedPositionMode);
+        telemetry.addData("Goal", "RED %s (%.1f, %.1f) | %.1f in",
+                upperGoalSelected ? "UPPER" : "LOWER", goalX, goalY, distanceToGoalIn);
+        telemetry.addData("Aim", "%s | last: %s",
+                poseAimThisShot ? "POSE AIM" : "PRESET", lastAimShot);
         if (visionAvailable) {
-            telemetry.addData("Vision", "%s | bearing %.1f | %s",
-                    Turret.lastVisionStatus, Turret.lastVisionBearingDeg, lastVisionShot);
+            telemetry.addData("Vision", "%s | bearing %.1f | correction %.1f | %s",
+                    Turret.lastVisionStatus, Turret.lastVisionBearingDeg,
+                    Turret.lastVisionCorrectionDeg, lastVisionShot);
         } else {
             telemetry.addData("Vision", useVisionAim ? "LIMELIGHT NOT FOUND - presets only" : "OFF");
         }
@@ -947,6 +1118,9 @@ public class FlowerRedAutoFast extends OpMode {
                 outtake.getCurrentTPS(),
                 outtake.getTargetTPS()
         );
+        telemetry.addData("Regression", "%s (%s)",
+                outtake.isUsingDistanceRegression() ? "LUT" : "FIXED TPS",
+                outtake.getRegressionStatus());
         telemetry.addData("Shooter Ready", isShooterAtSpeed());
         telemetry.addData("Ready Timeout", shooterReadyTimeoutFired);
         // Feeder is open loop now (no encoder), so show its power, not TPS
