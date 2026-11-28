@@ -25,6 +25,72 @@ import org.firstinspires.ftc.teamcode.pedro.Constants;
 
 import java.util.List;
 
+/**
+ * Combined TeleOp, Pinpoint-only turret aiming (no camera).
+ *
+ * Goal naming: the "upper" and "lower" goals here are the two goals at
+ * different field Y positions. In Turret they map to the per-goal angle
+ * trims:
+ *
+ *   UPPER goal -> Turret.HIGH_GOAL_ANGLE_TRIM_DEG
+ *   LOWER goal -> Turret.LOW_GOAL_ANGLE_TRIM_DEG
+ *
+ * The goal coordinates themselves are the RED_/BLUE_ UPPER/LOWER fields
+ * in this class. The Turret's own RED_LOW_GOAL_X/Y style coordinate
+ * fields are not used by this TeleOp.
+ *
+ * Feeding: the safety checks (shooter on, aim, regression, at speed) are
+ * made once when the right trigger starts a burst. While the trigger stays
+ * held the burst keeps going, so the flywheel dipping after each ball does
+ * not stop and restart the feed. Set checkOnlyAtBurstStart = false to
+ * go back to checking every loop.
+ *
+ * Robustness (disconnect investigation):
+ *  1. stop() does not call follower.update(). That reads the Pinpoint over
+ *     I2C and can block stop() if the bus has faulted, which makes the SDK
+ *     restart the robot. The SDK zeroes all motors on stop anyway.
+ *  2. Slow loops are written to the robot log and the worst loop time is
+ *     shown in telemetry.
+ *  3. ODOMETRY FALLBACK. If follower.update() throws, returns an invalid
+ *     pose, or is repeatedly slow (Pinpoint I2C fault after a hit), the
+ *     TeleOp stops using Pedro and drives the four wheels directly, so the
+ *     robot keeps driving. While in fallback:
+ *       - the turret is locked to centre and auto aim is off;
+ *       - fixed-turret shooting stays available (fixed TPS, no regression);
+ *       - corner resets are blocked (the pose is not being tracked).
+ *     It probes the Pinpoint every odometryRetryIntervalMs and returns to
+ *     Pedro after odometryRecoverCount good updates in a row. The turret
+ *     stays centred after recovery until a corner reset re-establishes the
+ *     pose; auto aim and regression then come back by themselves.
+ *
+ * Shooting mode (see updateShootingMode):
+ *   NORMAL  = auto aim + lookup-table distance regression. This is the
+ *             default whenever the pose is good.
+ *   FIXED   = turret locked centre + fixed TPS (RobotConstants.outtakeTps).
+ *             Used only when there is no trustworthy distance: odometry
+ *             offline (Pinpoint fault), or no pose yet (do a corner reset).
+ *             The manual G2 Square / G1 Circle overrides are off by default
+ *             (allowManualFixedShooting, allowManualRegressionToggle).
+ *
+ * Limelight (on the turret): odometry gives the coarse aim; when the goal
+ * cluster is visible its bearing corrects the aim (Turret "Vision
+ * correction"). With odometry offline or no pose, the turret aims from the
+ * camera alone (VISION ONLY) at fixed TPS, and feeding waits until the
+ * camera says it's on target. If the Limelight is missing, everything
+ * works as before.
+ *
+ * Shoot on the move (shootOnMoveEnabled, OFF by default): while driving,
+ * the turret and the lookup table aim at a "virtual goal", the real goal
+ * shifted against the robot's velocity by the ball's time of flight:
+ *   virtualGoal = goal - velocity x timeOfFlight(distance)   (iterated)
+ * The robot's pose is also predicted shotLatencyS ahead (gate + feeder +
+ * servo delay). The Limelight correction is still measured against the
+ * real goal, and only while slower than visionMaxSpeedInPerS. Feeding is
+ * blocked above maxShootSpeedInPerS. See "Shoot on the move" below.
+ *
+ * The four drive motor names below match drivetrainConfig in pedro/Constants.java;
+ * test the fallback on blocks (see fallbackStrafeSign / fallbackTurnSign).
+ */
 @Configurable
 @TeleOp(name = "0. Combined TeleOp", group = "Main")
 public class CombinedTeleOp extends OpMode {
@@ -62,6 +128,61 @@ public class CombinedTeleOp extends OpMode {
     public static boolean CUBIC_STRAFE_TURN = false;
 
     public static boolean ALLOW_FIXED_TURRET_FEED = true;
+
+    // ---------------------------------------------------------------------
+    // Shoot on the move (26 Nov 2026). OFF (27 Nov 2026, turret erratic): set true in Panels to test.
+    //
+    // Time of flight (seconds) at four turret-to-goal distances (inches).
+    // THESE ARE PLACEHOLDERS: film shots in slow motion at each distance,
+    // count frames from the ball leaving to reaching the goal, divide by the
+    // frame rate (e.g. 240 fps), and put the real numbers here. Distances
+    // must increase from 1 to 4. Outside the table the end value is used.
+    //
+    // Tuning order: strafe sideways past the goal at one distance and
+    // adjust leadScale until moving shots land (1.0 = trust the table);
+    // then drive straight toward/away and check range (LUT distance).
+    // ---------------------------------------------------------------------
+    public static boolean shootOnMoveEnabled = false;  // off 27 Nov 2026: turret too erratic
+    public static double tofDist1 = 27.0;
+    public static double tofSec1 = 0.30;
+    public static double tofDist2 = 39.0;
+    public static double tofSec2 = 0.36;
+    public static double tofDist3 = 51.0;
+    public static double tofSec3 = 0.42;
+    public static double tofDist4 = 63.0;
+    public static double tofSec4 = 0.48;
+    /** Multiplies the lead. Tune this first. */
+    public static double leadScale = 1.0;
+    /** Predict the robot this far ahead: trigger-to-ball-out delay (gate, feeder, servo). */
+    public static double shotLatencyS = 0.0;            // was 0.10 (27 Nov: no prediction while testing)
+    /** Velocity smoothing per loop (0-1). Lower = smoother but slower to react. */
+    public static double velocityFilterAlpha = 0.15;    // was 0.35 (smoother speed)
+    /** Below this speed the robot counts as stopped (no lead, no prediction). */
+    public static double velocityDeadbandInPerS = 6.0;  // was 2.0 (ignore small drift)
+    /** Below this turn rate (deg/s) heading isn't predicted ahead. */
+    public static double turnDeadbandDegPerS = 30.0;    // was 10.0
+    /** A new burst won't start above this speed. */
+    public static double maxShootSpeedInPerS = 30.0;
+    /** Limelight frames only update the correction below this speed. */
+    public static double visionMaxSpeedInPerS = 8.0;
+    /** Virtual-goal iterations (time of flight depends on distance). */
+    public static int leadIterations = 3;
+
+    // ---------------------------------------------------------------------
+    // Distance check (28 Nov 2026): LOGGING ONLY, changes nothing.
+    // Shows the odometry distance to the goal next to the Limelight's range
+    // to the goal cluster, so we can see how they compare (and how far the
+    // Pinpoint drifts after a hit) before letting the camera set the shooter
+    // speed. Also written to the robot log every distanceLogIntervalMs while
+    // the robot is nearly still and the cluster is in view, and at the start
+    // of every burst. Search the log for "DistCheck".
+    // ---------------------------------------------------------------------
+    public static boolean distanceCheckLogging = true;
+    public static double distanceLogIntervalMs = 500.0;
+    /** Only the periodic log lines: robot must be slower than this. */
+    public static double distanceLogMaxSpeedInPerS = 3.0;
+    /** Smoothing for the Limelight range (0-1). */
+    public static double limelightRangeAlpha = 0.3;
 
     /** Use the Limelight for aiming. Off = odometry-only aim, as before. */
     public static boolean visionEnabled = true;
@@ -231,6 +352,27 @@ public class CombinedTeleOp extends OpMode {
     private double goalY = Double.NaN;
     private double distanceToGoalIn = Double.NaN;
 
+    // Shoot on the move state
+    private double velX;              // field frame, in/s (filtered)
+    private double velY;
+    private double omega;             // rad/s (filtered)
+    private double robotSpeed;        // in/s
+    private Pose lastVelocityPose;
+    private long lastVelocityNs;
+    private double leadX;             // virtual goal - real goal, inches
+    private double leadY;
+    private double tofS = Double.NaN;
+    private double realDistanceIn = Double.NaN;
+
+    // Distance check state
+    private double llRangeIn = Double.NaN;          // latest raw Limelight range, inches
+    private double llRangeSmoothedIn = Double.NaN;  // smoothed
+    private int llTagCount;
+    private long llLastSeenNs;
+    private double odoDistanceIn = Double.NaN;      // odometry turret-to-goal distance
+    private final ElapsedTime distanceLogTimer = new ElapsedTime();
+    private boolean previousBurstActive;
+
     private boolean feederRequested;
     private boolean feederPermitted;
     private boolean fixedTurretFeedOverride;
@@ -346,7 +488,7 @@ public class CombinedTeleOp extends OpMode {
 
         Outtake.DISTANCE_REGRESSION_ENABLED = REGRESSION_ON_AT_START;
         Outtake.HOOD_COMP_ENABLED = false;
-        Turret.velocityCompensationActive = true;
+        Turret.velocityCompensationActive = false;   // old fixed lead; shoot on the move replaces it
         turret.setCentre();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
         robotSettings.block();
@@ -475,6 +617,7 @@ public class CombinedTeleOp extends OpMode {
 
         Pose currentPose = follower.pose();
         if (poseEstablished && validPose(currentPose)) PoseStorage.setPose(currentPose);
+        updateVelocity(currentPose);
 
         handleManualGoalSelection();
         if (manualGoalMode) applySelectedGoal();
@@ -483,6 +626,7 @@ public class CombinedTeleOp extends OpMode {
         handleTurretModeControls();
         updateShootingMode();
         updateVision();
+        updateDistanceCheck(currentPose);
         if (autoAimMode) updateTurretAim(currentPose);
         else if (canAimVisionOnly()) aimVisionOnly();
         else lockTurretCentre();
@@ -768,6 +912,9 @@ public class CombinedTeleOp extends OpMode {
 
         if (!shooterActive) return blockFeed("SHOOTER OFF");
 
+        if (shootOnMoveEnabled && robotSpeed > maxShootSpeedInPerS)
+            return blockFeed(String.format("MOVING TOO FAST (%.0f in/s)", robotSpeed));
+
         if (turret.isVisionOnlyAim() && !turret.isVisionOnTarget())
             return blockFeed("VISION NOT ON TARGET");
 
@@ -963,13 +1110,127 @@ public class CombinedTeleOp extends OpMode {
 
     private void updateTurretAim(Pose pose) {
         distanceToGoalIn = Double.NaN;
+        realDistanceIn = Double.NaN;
+        leadX = leadY = 0.0;
+        tofS = Double.NaN;
         if (!targetValid || !poseEstablished || !validPose(pose)) {
             if (autoAimMode) turret.setCentre();
             return;
         }
+
+        if (shootOnMoveEnabled) {
+            // Aim + lookup table use the virtual goal from the predicted pose
+            Pose predicted = computeVirtualGoal(pose);
+            if (!autoAimMode) return;
+            turret.aimTurretWithLead(predicted, leadX, leadY);
+            return;
+        }
+
         distanceToGoalIn = calculateDistanceToGoal(pose);
+        realDistanceIn = distanceToGoalIn;
         if (!autoAimMode) return;
         turret.aimTurret(pose, 0.0, 0.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Shoot on the move
+    // ---------------------------------------------------------------------
+
+    /**
+     * Field-frame velocity from the change in pose between loops, smoothed.
+     * Works the same with the Pinpoint or the expander. Reset whenever the
+     * pose jumps (reset, heading snap) or isn't being tracked.
+     */
+    private void updateVelocity(Pose pose) {
+        long now = System.nanoTime();
+        if (!validPose(pose) || odometryFaulted || !poseEstablished || poseResetThisLoop) {
+            velX = velY = omega = robotSpeed = 0.0;
+            lastVelocityPose = null;
+            turret.setVisionUpdatesAllowed(true);
+            return;
+        }
+        if (lastVelocityPose != null) {
+            double dt = (now - lastVelocityNs) / 1e9;
+            if (dt > 0.002 && dt < 0.25) {
+                double rawX = (pose.x() - lastVelocityPose.x()) / dt;
+                double rawY = (pose.y() - lastVelocityPose.y()) / dt;
+                double dh = Math.atan2(Math.sin(pose.heading() - lastVelocityPose.heading()),
+                        Math.cos(pose.heading() - lastVelocityPose.heading()));
+                double rawW = dh / dt;
+                double a = Math.max(0.0, Math.min(1.0, velocityFilterAlpha));
+                velX += a * (rawX - velX);
+                velY += a * (rawY - velY);
+                omega += a * (rawW - omega);
+            } else if (dt >= 0.25) {
+                velX = velY = omega = 0.0;   // long gap: don't trust old speed
+            }
+        }
+        lastVelocityPose = pose;
+        lastVelocityNs = now;
+        robotSpeed = Math.hypot(velX, velY);
+
+        // Blurred, late frames while moving fast would corrupt the correction
+        turret.setVisionUpdatesAllowed(!shootOnMoveEnabled || robotSpeed <= visionMaxSpeedInPerS);
+    }
+
+    /**
+     * Predicts the pose shotLatencyS ahead, then finds the virtual goal:
+     * the goal shifted against the velocity by the time of flight, iterated
+     * because time of flight depends on distance. Sets leadX/leadY,
+     * distanceToGoalIn (virtual, for the lookup table), realDistanceIn and
+     * tofS. Returns the predicted pose to aim from.
+     */
+    private Pose computeVirtualGoal(Pose pose) {
+        boolean moving = robotSpeed > velocityDeadbandInPerS;
+        boolean turning = Math.abs(Math.toDegrees(omega)) > turnDeadbandDegPerS;
+        double vx = moving ? velX : 0.0;
+        double vy = moving ? velY : 0.0;
+        double w = turning ? omega : 0.0;
+        double latency = Math.max(0.0, shotLatencyS);
+
+        Pose predicted = new Pose(
+                pose.x() + vx * latency,
+                pose.y() + vy * latency,
+                pose.heading() + w * latency);
+
+        double h = predicted.heading();
+        double pivotX = predicted.x() + Turret.TURRET_OFFSET_X_IN * Math.cos(h)
+                - Turret.TURRET_OFFSET_Y_IN * Math.sin(h);
+        double pivotY = predicted.y() + Turret.TURRET_OFFSET_X_IN * Math.sin(h)
+                + Turret.TURRET_OFFSET_Y_IN * Math.cos(h);
+
+        double scale = Double.isFinite(leadScale) ? leadScale : 1.0;
+        double virtualX = goalX;
+        double virtualY = goalY;
+        double t = 0.0;
+        for (int i = 0; i < Math.max(1, leadIterations); i++) {
+            t = timeOfFlight(Math.hypot(virtualX - pivotX, virtualY - pivotY));
+            virtualX = goalX - vx * t * scale;
+            virtualY = goalY - vy * t * scale;
+        }
+
+        leadX = virtualX - goalX;
+        leadY = virtualY - goalY;
+        tofS = t;
+        realDistanceIn = Math.hypot(goalX - pivotX, goalY - pivotY);
+        distanceToGoalIn = Math.hypot(virtualX - pivotX, virtualY - pivotY);
+        return predicted;
+    }
+
+    /** Time of flight (s) from the 4-point table, linear between points, held at the ends. */
+    private double timeOfFlight(double distance) {
+        double[] d = {tofDist1, tofDist2, tofDist3, tofDist4};
+        double[] t = {tofSec1, tofSec2, tofSec3, tofSec4};
+        if (!Double.isFinite(distance)) return t[0];
+        if (distance <= d[0]) return t[0];
+        for (int i = 1; i < d.length; i++) {
+            if (distance <= d[i]) {
+                double span = d[i] - d[i - 1];
+                if (span <= 0.0) return t[i];
+                return t[i - 1] + (t[i] - t[i - 1]) * (distance - d[i - 1]) / span;
+            }
+        }
+        return t[d.length - 1];
     }
 
     /**
@@ -1021,6 +1282,7 @@ public class CombinedTeleOp extends OpMode {
                             ? LimelightCam.Alliance.RED : LimelightCam.Alliance.BLUE);
             if (d != null) {
                 turret.setVisionMeasurement(true, d.bearing, limelightCam.getFrameId());
+                recordLimelightRange(d.range, d.tagCount);
             } else {
                 turret.clearVisionMeasurement();
             }
@@ -1048,6 +1310,58 @@ public class CombinedTeleOp extends OpMode {
         distanceToGoalIn = Double.NaN;
         turret.aimVisionOnly();
         fixedTurretFeedOverride = ALLOW_FIXED_TURRET_FEED;
+    }
+
+    // ---------------------------------------------------------------------
+    // Distance check (logging only)
+    // ---------------------------------------------------------------------
+
+    private void recordLimelightRange(double rangeIn, int tags) {
+        if (!Double.isFinite(rangeIn) || rangeIn <= 0.0) return;
+        long now = System.nanoTime();
+        // Restart the smoothing after a gap, so an old value doesn't drag
+        boolean gap = (now - llLastSeenNs) / 1e6 > 300.0;
+        double a = Math.max(0.0, Math.min(1.0, limelightRangeAlpha));
+        llRangeSmoothedIn = (gap || !Double.isFinite(llRangeSmoothedIn))
+                ? rangeIn : llRangeSmoothedIn + a * (rangeIn - llRangeSmoothedIn);
+        llRangeIn = rangeIn;
+        llTagCount = tags;
+        llLastSeenNs = now;
+    }
+
+    /** True if the Limelight saw the goal cluster in the last 300 ms. */
+    private boolean limelightRangeFresh() {
+        return Double.isFinite(llRangeSmoothedIn)
+                && (System.nanoTime() - llLastSeenNs) / 1e6 <= 300.0;
+    }
+
+    /**
+     * Works out the odometry distance (independent of aim mode) and writes
+     * both distances to the robot log: periodically while nearly still, and
+     * at the start of each burst.
+     */
+    private void updateDistanceCheck(Pose pose) {
+        odoDistanceIn = targetValid && poseEstablished && validPose(pose)
+                ? calculateDistanceToGoal(pose) : Double.NaN;
+
+        boolean burstStarted = burstActive && !previousBurstActive;
+        previousBurstActive = burstActive;
+        if (!distanceCheckLogging || !limelightRangeFresh()) return;
+
+        boolean periodic = robotSpeed <= distanceLogMaxSpeedInPerS
+                && distanceLogTimer.milliseconds() >= distanceLogIntervalMs;
+        if (!periodic && !burstStarted) return;
+        distanceLogTimer.reset();
+
+        Pose p = validPose(pose) ? pose : null;
+        RobotLog.ii(logTag, "DistCheck %s odo %.1f | LL %.1f (raw %.1f, %d tags) | diff %+.1f"
+                        + " | pose (%.1f, %.1f, %.0f) | speed %.0f | TPS %.0f/%.0f",
+                burstStarted ? "SHOT" : "still",
+                odoDistanceIn, llRangeSmoothedIn, llRangeIn, llTagCount,
+                llRangeSmoothedIn - odoDistanceIn,
+                p == null ? Double.NaN : p.x(), p == null ? Double.NaN : p.y(),
+                p == null ? Double.NaN : Math.toDegrees(p.heading()),
+                robotSpeed, outtake.getCurrentTPS(), outtake.getTargetTPS());
     }
 
     private double calculateDistanceToGoal(Pose pose) {
@@ -1500,6 +1814,8 @@ public class CombinedTeleOp extends OpMode {
                 RobotConstants.outtakeTps, shooterTpsOffset);
         telemetry.addData("At Speed", outtake.isAtSpeed(RobotConstants.feedSpeedToleranceTps));
         telemetry.addData("Raw / Filtered TPS", "%.0f / %.0f", outtake.getRawTPS(), outtake.getCurrentTPS());
+        telemetry.addData("Feed Link", "scale %.2f | %.0f TPS",
+                outtake.getFeedLinkScale(), outtake.getFeedLinkTPS());
         telemetry.addData("Feeder", "%s (burst %s, gate %s)",
                 feederPermitted ? "ON" : "OFF",
                 burstActive ? "active" : "idle",
@@ -1543,6 +1859,14 @@ public class CombinedTeleOp extends OpMode {
                 manualGoalMode ? "manual" : "auto");
         telemetry.addData("Target", "(%.2f, %.2f)", goalX, goalY);
         telemetry.addData("Distance", "%.2f in", distanceToGoalIn);
+        telemetry.addData("Distance Check", limelightRangeFresh()
+                ? String.format("odo %.1f | LL %.1f (%d tags) | diff %+.1f in",
+                odoDistanceIn, llRangeSmoothedIn, llTagCount, llRangeSmoothedIn - odoDistanceIn)
+                : String.format("odo %.1f | LL not in view", odoDistanceIn));
+        telemetry.addData("Shoot on Move", shootOnMoveEnabled
+                ? String.format("ON | %.0f in/s, %.0f deg/s | lead (%.1f, %.1f) in | tof %.2f s | dist %.0f -> %.0f in",
+                robotSpeed, Math.toDegrees(omega), leadX, leadY, tofS, realDistanceIn, distanceToGoalIn)
+                : String.format("OFF | %.0f in/s", robotSpeed));
         telemetry.addData("Angle Trim", "%.2f deg", Turret.lastAngleTrimDeg);
         telemetry.addData("Requested / Commanded", "%.1f / %.1f deg",
                 Turret.lastRelativeAngleDeg, Turret.lastFinalAngleDeg);

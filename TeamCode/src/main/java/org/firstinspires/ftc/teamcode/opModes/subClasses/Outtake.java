@@ -56,6 +56,34 @@ public class Outtake {
     public static double HOOD_MAX = 0.80;
     public static double HOOD_MIN_STEP = 0.002;
 
+    // ---------------------------------------------------------------------
+    // Feed link: feeder power follows flywheel speed
+    // ---------------------------------------------------------------------
+
+    /*
+     * When the feeder is on (forward) and the flywheel is spinning, the
+     * feeder power is scaled down while the flywheel is below target, so
+     * the next ball waits for the flywheel to recover instead of leaving
+     * slow. Only "below target" slows it; overspeed never does.
+     *
+     *   speed within feedLinkFullBandFraction of target -> full feeder power
+     *   between full band and feedLinkMinBandFraction   -> scaled smoothly
+     *   below feedLinkMinBandFraction                   -> feedLinkMinScale
+     *
+     * feedLinkMinScale stays above zero so a ball half-way into the
+     * flywheel is never left stalled against it.
+     *
+     * Uses its own faster speed filter (feedLinkFilterAlpha on the raw
+     * encoder speed), so the flywheel controller's tuning is unchanged.
+     */
+    public static boolean feedLinkEnabled = true;
+    public static double feedLinkFullBandFraction = 0.015;  // 1.5 % low: full power
+    public static double feedLinkMinBandFraction = 0.04;    // 4 % low: minimum
+    public static double feedLinkMinScale = 0.30;           // of the requested power
+    public static double feedLinkFilterAlpha = 0.50;
+    // Skip hub writes for changes smaller than this (saves loop time)
+    public static double feedLinkMinPowerStep = 0.02;
+
     // Hood velocity compensation (keep OFF while collecting tuning data)
     public static boolean HOOD_COMP_ENABLED = false;
     public static double HOOD_COMP_GAIN = 0.05;
@@ -285,6 +313,11 @@ public class Outtake {
     // Feeder state: requested power and last power sent to the motor
     private double feederRequested;
     private double commandedFeederPower;
+
+    // Feed link state
+    private double feedLinkTPS;
+    private boolean feedLinkPrimed;
+    private double feedLinkScale = 1.0;
 
     private double filteredVoltage;
     private double voltageScale = 1.0;
@@ -552,10 +585,65 @@ public class Outtake {
 
     private void applyFeederPower() {
         if (feederMotor == null) return;
-        // Only write to the hub when the value changes, to save loop time
-        if (feederRequested != commandedFeederPower) {
-            commandedFeederPower = feederRequested;
+
+        double wanted = feederRequested;
+        feedLinkScale = 1.0;
+        boolean linked = feedLinkEnabled && wanted > 0.0;
+        if (linked) {
+            feedLinkScale = computeFeedLinkScale();
+            wanted = feederRequested * feedLinkScale;
+        }
+
+        // Only write to the hub when the value changes, to save loop time.
+        // Linked changes smaller than feedLinkMinPowerStep are skipped, but
+        // on/off, direction changes and reaching full power always go out.
+        double difference = Math.abs(wanted - commandedFeederPower);
+        if (difference == 0.0) return;
+        double step = Double.isFinite(feedLinkMinPowerStep) ? Math.abs(feedLinkMinPowerStep) : 0.0;
+        boolean mustWrite = !linked
+                || commandedFeederPower <= 0.0
+                || wanted == feederRequested
+                || difference >= step;
+        if (mustWrite) {
+            commandedFeederPower = wanted;
             feederMotor.setPower(commandedFeederPower);
+        }
+    }
+
+    /** Feeder scale (feedLinkMinScale..1) from how far the flywheel is below target. */
+    private double computeFeedLinkScale() {
+        if (shooter == null || !feedLinkPrimed) return 1.0;
+        double target = Math.abs(shooter.targetTPS);
+        if (!Double.isFinite(target) || target <= 0.0) return 1.0;
+
+        double full = Double.isFinite(feedLinkFullBandFraction)
+                ? Math.abs(feedLinkFullBandFraction) : 0.015;
+        double low = Double.isFinite(feedLinkMinBandFraction)
+                ? Math.abs(feedLinkMinBandFraction) : 0.04;
+        double minScale = Double.isFinite(feedLinkMinScale)
+                ? clamp(feedLinkMinScale, 0.0, 1.0) : 0.30;
+        if (low <= full) low = full + 0.001;
+
+        double shortfall = (target - feedLinkTPS) / target;  // > 0 when slow
+        if (shortfall <= full) return 1.0;
+        if (shortfall >= low) return minScale;
+        double t = (shortfall - full) / (low - full);
+        return 1.0 - t * (1.0 - minScale);
+    }
+
+    /** Fast speed filter used only by the feed link. Call once per loop. */
+    private void updateFeedLinkSpeed() {
+        if (shooter == null || !shooter.primed || !Double.isFinite(shooter.rawTPS)) {
+            feedLinkPrimed = false;
+            return;
+        }
+        if (!feedLinkPrimed) {
+            feedLinkTPS = shooter.rawTPS;
+            feedLinkPrimed = true;
+        } else {
+            double alpha = Double.isFinite(feedLinkFilterAlpha)
+                    ? clamp(feedLinkFilterAlpha, 0.0, 1.0) : 1.0;
+            feedLinkTPS += alpha * (shooter.rawTPS - feedLinkTPS);
         }
     }
 
@@ -582,6 +670,7 @@ public class Outtake {
         updateShotTargets();
         updateVoltageScale();
         shooter.update(kF, kP, voltageScale, VELOCITY_FILTER_ALPHA);
+        updateFeedLinkSpeed();
         updateHood();
     }
 
@@ -611,6 +700,8 @@ public class Outtake {
         if (shooter != null) shooter.stop();
         feederRequested = 0.0;
         commandedFeederPower = 0.0;
+        feedLinkPrimed = false;
+        feedLinkScale = 1.0;
         if (feederMotor != null) feederMotor.setPower(0.0);
         voltagePrimed = false;
         voltageScale = 1.0;
@@ -734,6 +825,12 @@ public class Outtake {
     public double getCommandedPower() { return shooter == null ? 0.0 : shooter.power; }
 
     public double getFeederCommandedPower() { return commandedFeederPower; }
+
+    /** Current feed-link scale (1 = full power, lower = waiting for the flywheel). */
+    public double getFeedLinkScale() { return feedLinkScale; }
+
+    /** Flywheel speed as seen by the feed link (faster filter than getCurrentTPS). */
+    public double getFeedLinkTPS() { return feedLinkTPS; }
 
     public double getFixedHoodBase() { return fixedHoodBase; }
     public double getHoodBase() { return hoodBase; }

@@ -49,7 +49,7 @@ public class RobotConstants {
     // Hood
     // -------------------------------------------------------------------------
 
-    public static double hoodPosition = 0.40;
+    public static double hoodPosition = 0.65;
 
 
     // -------------------------------------------------------------------------

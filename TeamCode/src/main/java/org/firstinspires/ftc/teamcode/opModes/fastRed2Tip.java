@@ -69,8 +69,8 @@ import java.util.List;
  * times (all pollen in?) and DRIVE_SPEED on paths 4/6 (heading wobble).
  */
 @Configurable
-@Autonomous(name = "02 - Flower Red Auto FAST", group = "Main")
-public class FlowerRedAutoFast extends OpMode {
+@Autonomous(name = "fastRed2Tip", group = "Main")
+public class fastRed2Tip extends OpMode {
 
     private List<LynxModule> allHubs;
     private Follower follower;
@@ -86,7 +86,7 @@ public class FlowerRedAutoFast extends OpMode {
 
     // Route / mechanism values unchanged from the supplied auto unless marked CHANGED.
     public static double PRELOAD_TURRET_POSITION = 0.0;
-    public static double FAR_WALL_TURRET_POSITION = 0.20;
+    public static double FAR_WALL_TURRET_POSITION = 0.35;
     public static double SECOND_FLOWER_TURRET_POSITION = 0.45;
     public static double TRAVEL_TURRET_POSITION = 0.50;
     public static double AUTO_TURRET_TRIM = 0.0;
@@ -100,7 +100,19 @@ public class FlowerRedAutoFast extends OpMode {
     public static double PARK_SPEED = 1.00;
 
     public static double TURRET_SETTLE_SECONDS = 0.15;        // was 0.20
-    public static double SHOOT_READY_TIMEOUT_SECONDS = 1.0;  // was 1.0
+    public static double SHOOT_READY_TIMEOUT_SECONDS = 1.5;  // was 1.0 (27 Nov: +0.5 s spool)
+    // Extra spool time (27 Nov 2026): once the shooter first reads at speed (or times out),
+    // keep spinning this much longer before feeding, so it's settled, not just touching speed.
+    public static double spoolUpExtraSeconds = 0.75;   // was 0.5 (27 Nov: shots overshooting)
+    // The shooter only counts as settled while it is WITHIN this fraction of its target, above
+    // OR below. Before, anything over 95% counted, so a flywheel still overshooting after
+    // spin-up (running fast) fed straight away and the balls went long. Leaving the band
+    // restarts the spoolUpExtraSeconds clock.
+    public static double shooterStableBandFraction = 0.03;
+    // The preload spins up from rest, so it gets longer before the "shoot anyway" timeout.
+    public static double preloadReadyTimeoutSeconds = 2.5;
+    // The turret is set to the preload position in init, so the first shot doesn't wait for it.
+    public static boolean firstShotSkipSettle = true;
     public static double BLOCK_RELEASE_SECONDS = 0.35;        // was 0.40
     public static double PRELOAD_FEED_SECONDS = 0.80;         // was 1.00
     public static double FLOWER_FEED_SECONDS = 1.30;          // was 1.60
@@ -110,23 +122,60 @@ public class FlowerRedAutoFast extends OpMode {
     public static double FLOWER_REVERSE_CLEAR_SECONDS = 0.25;       // was 0.35
     public static double FLOWER_LIFT_DELAY_SECONDS = 0.15;          // was 0.20
 
+    // First flower "bump" (27 Nov 2026): after the first intake hold, back off a little and
+    // drive back into the flower, to knock down any pollen that didn't drop. The intake runs
+    // (re-commanded every loop) and the flower stays down the whole time. bumpRepeats = 0 turns it off.
+    public static int bumpRepeats = 1;
+    // Same bump at the second (last) flower before the final shot. 0 turns it off.
+    // Uses the same bumpBackIn / bumpSpeed / bumpHoldSeconds / bumpTimeoutSeconds.
+    public static int secondBumpRepeats = 1;
+    public static double bumpBackIn = 8.0;          // how far to back off, inches (was 4.0)
+    public static double bumpSpeed = 0.45;          // path speed for both moves
+    public static double bumpHoldSeconds = 0.25;    // intake hold after driving back in
+    public static double bumpTimeoutSeconds = 1.5;  // per move (stall detection usually ends it first)
+
+    // Long drive toward the wall (path 4) moved toward the HIVE (27 Nov 2026), to keep clear of
+    // the partner parking on our side. Shifts the end of path 3 and both ends of path 4 in +X
+    // (toward the field centre / HIVE); path 5 then angles from there to the same wall point.
+    // Was 0 (path 4 at x = 32.4-32.7). CHECK the robot still clears the HIVE base.
+    public static double longDriveShiftIn = 4.0;   // was 6.0 (27 Nov: pushed over too far)
+
     // FAST: pass-through legs finish when this close to their end point (and heading within
     // passThroughHeadingDeg), without stopping, so the next leg carries on at speed.
     public static boolean passThroughEnabled = true;
     public static double passThroughToleranceIn = 4.0;
     public static double passThroughHeadingDeg = 25.0;
 
+    // Path 4 -> 5 hand-off (28 Nov 2026). Pedro slows every path down to stop at its end point,
+    // so path 4 was braking hard just before the hand-off, then path 5 had to accelerate again:
+    // the stop-and-jitter. Now path 4 aims path4OvershootIn PAST its real end, so the robot is
+    // still at speed when it reaches the hand-off point, and path 5 takes over there. If the
+    // robot passes the hand-off point off to one side, crossing it still counts. 0 = old way.
+    public static double path4OvershootIn = 12.0;
+
     // FAST: spin the shooter up in start() so the preload shot doesn't wait for it.
     public static boolean spinUpAtStart = true;
 
     // Limelight fine aim for each shot (see the other autos). Short timeout keeps it fast.
-    public static boolean useVisionAim = true;
+    public static boolean useVisionAim = false;   // 27 Nov 2026: fixed turret presets only
     public static double visionAimTimeoutSeconds = 0.40;
 
     // Shot aiming from odometry (+ Limelight correction) instead of fixed presets.
-    public static boolean usePoseAim = true;
+    public static boolean usePoseAim = false;     // 27 Nov 2026: fixed turret presets only
     // Flywheel speed + hood from the Outtake lookup table (distance to goal).
+    // Ignored while useShotTps is on.
     public static boolean useLutRegression = true;
+
+    // Fixed flywheel speed per shot (27 Nov 2026). When on, these replace the lookup table for
+    // this auto. After each shot the flywheel goes straight to the NEXT shot's speed, so it is
+    // already there when the robot arrives. Hood: NaN = RobotConstants.hoodPosition.
+    public static boolean useShotTps = true;
+    public static double shot1Tps = 1970.0;   // preload
+    public static double shot2Tps = 2000.0;   // far wall
+    public static double shot3Tps = 1970.0;   // second flower
+    public static double shot1Hood = Double.NaN;
+    public static double shot2Hood = Double.NaN;
+    public static double shot3Hood = Double.NaN;
     // Longest a shot waits for the pose aim (turret settled, Limelight locked) before firing.
     public static double poseAimMaxWaitSeconds = 0.60;
     // Sanity check on the pose aim. Your presets are tuned and known good, so if the odometry
@@ -160,6 +209,18 @@ public class FlowerRedAutoFast extends OpMode {
     public static double STALL_MOVE_TOLERANCE_IN = 0.3;
     public static double STALL_TIME_SECONDS = 0.30;
 
+    // Stall detection on EVERY path (27 Nov 2026). If the odometry shows the robot hasn't
+    // moved more than stallMinMoveIn AND hasn't turned more than stallMinTurnDeg for
+    // stallWindowSeconds, it's blocked (another robot, a wall, a ball under a wheel) and the
+    // leg ends straight away instead of pushing until its PATHn_TIMEOUT_SECONDS. The fixed
+    // timeouts stay as a backstop. stallGraceSeconds skips the start of each leg, while the
+    // robot is still accelerating. Also catches a frozen odometry reading (I2C fault).
+    public static boolean stallDetectAllPaths = true;
+    public static double stallGraceSeconds = 0.40;
+    public static double stallWindowSeconds = 0.35;
+    public static double stallMinMoveIn = 0.5;
+    public static double stallMinTurnDeg = 3.0;
+
     // NEW: shot sequencing.
     // The blocker starts opening once the turret has settled and the shooter is above this
     // fraction of target, instead of waiting for TPS_READY_FRACTION first. Feeding still waits
@@ -185,6 +246,10 @@ public class FlowerRedAutoFast extends OpMode {
     private boolean currentPathTimedOut = false;
     private String lastTimedOutPath = "NONE";
     private String lastStallExitPath = "NONE";
+    private String lastBlockedPath = "NONE";
+    private int blockedCount = 0;
+    private Pose blockedRefPose = null;
+    private double blockedRefTime = 0.0;
 
     // NEW: per-path tracking state and loop timing.
     private double pathStartTime = 0.0;
@@ -204,6 +269,8 @@ public class FlowerRedAutoFast extends OpMode {
     private double shootFeedSeconds = 0.0;
     private double turretMoveTime = 0.0;
     private boolean legDone = false;
+    private double shooterFirstReadyTime = -1.0;   // when the shooter entered the stable band
+    private double activeReadyTimeoutSeconds = 1.5;
 
     // Limelight shot state
     private boolean visionLocked = false;
@@ -251,6 +318,7 @@ public class FlowerRedAutoFast extends OpMode {
         final double timeoutSeconds;
         final String name;
         final boolean passThrough;   // FAST: don't stop at the end, hand straight to the next leg
+        final Pose passPoint;        // where a pass-through hands over (default: end)
 
         Leg(Pose plannedStart, Pose end, double speed, boolean reverseTangent,
             boolean stallExit, double timeoutSeconds, String name) {
@@ -267,6 +335,21 @@ public class FlowerRedAutoFast extends OpMode {
             this.timeoutSeconds = timeoutSeconds;
             this.name = name;
             this.passThrough = passThrough;
+            this.passPoint = end;
+        }
+
+        /** Pass-through leg that drives toward `end` but hands over at `passPoint`. */
+        Leg(Pose plannedStart, Pose end, Pose passPoint, double speed, double timeoutSeconds,
+            String name) {
+            this.plannedStart = plannedStart;
+            this.end = end;
+            this.speed = speed;
+            this.reverseTangent = false;
+            this.stallExit = false;
+            this.timeoutSeconds = timeoutSeconds;
+            this.name = name;
+            this.passThrough = true;
+            this.passPoint = passPoint;
         }
     }
 
@@ -280,18 +363,37 @@ public class FlowerRedAutoFast extends OpMode {
                 PATH2_TIMEOUT_SECONDS, "PATH 2");
     }
 
+    /** Moves a pose toward the HIVE (+X) by longDriveShiftIn. */
+    private Pose shiftTowardHive(Pose p) {
+        double shift = Double.isFinite(longDriveShiftIn) ? longDriveShiftIn : 0.0;
+        return new Pose(p.x() + shift, p.y(), p.heading());
+    }
+
     private Leg leg3() {
-        return new Leg(point2, point3, FLOWER_APPROACH_SPEED, true, false,
+        return new Leg(point2, shiftTowardHive(point3), FLOWER_APPROACH_SPEED, true, false,
                 PATH3_TIMEOUT_SECONDS, "PATH 3", true);
     }
 
     private Leg leg4() {
-        return new Leg(point4Start, point4, DRIVE_SPEED, false, false,
-                PATH4_TIMEOUT_SECONDS, "PATH 4", true);
+        Pose from = shiftTowardHive(point4Start);
+        Pose handoff = shiftTowardHive(point4);
+        double over = passThroughEnabled ? Math.max(0.0, path4OvershootIn) : 0.0;
+        if (over <= 0.0) {
+            return new Leg(from, handoff, DRIVE_SPEED, false, false,
+                    PATH4_TIMEOUT_SECONDS, "PATH 4", true);
+        }
+        // Aim past the hand-off point along the direction of travel, same end heading
+        double dx = handoff.x() - from.x();
+        double dy = handoff.y() - from.y();
+        double len = Math.hypot(dx, dy);
+        Pose beyond = len < 1e-6 ? handoff
+                : new Pose(handoff.x() + dx / len * over, handoff.y() + dy / len * over,
+                handoff.heading());
+        return new Leg(from, beyond, handoff, DRIVE_SPEED, PATH4_TIMEOUT_SECONDS, "PATH 4");
     }
 
     private Leg leg5() {
-        return new Leg(point5Start, point5, WALL_APPROACH_SPEED, false, true,
+        return new Leg(shiftTowardHive(point5Start), point5, WALL_APPROACH_SPEED, false, true,
                 PATH5_TIMEOUT_SECONDS, "PATH 5");
     }
 
@@ -340,6 +442,7 @@ public class FlowerRedAutoFast extends OpMode {
                     if (onStart != null) onStart.run();
                     pathStartTime = getRuntime();
                     stallRefPose = null;
+                    blockedRefPose = null;
                     currentPathTimedOut = false;
                     legDone = false;
                     follower.follow(buildPath(leg));
@@ -366,10 +469,20 @@ public class FlowerRedAutoFast extends OpMode {
         if (getRuntime() - pathStartTime < MIN_PATH_RUNTIME_SECONDS) return false;
         Pose pose = follower.pose();
         if (pose == null) return false;
+        Pose pass = leg.passPoint;
         double headingErrDeg = Math.abs(angleDiffDeg(
-                Math.toDegrees(leg.end.heading()), Math.toDegrees(pose.heading())));
-        return distanceToEnd(leg) <= passThroughToleranceIn
-                && headingErrDeg <= passThroughHeadingDeg;
+                Math.toDegrees(pass.heading()), Math.toDegrees(pose.heading())));
+        double dist = Math.hypot(pass.x() - pose.x(), pass.y() - pose.y());
+        if (dist <= passThroughToleranceIn && headingErrDeg <= passThroughHeadingDeg) return true;
+
+        // Overshoot legs: crossing the hand-off point counts, even if off to one side
+        if (pass != leg.end) {
+            double dirX = leg.end.x() - pass.x();
+            double dirY = leg.end.y() - pass.y();
+            double along = (pose.x() - pass.x()) * dirX + (pose.y() - pass.y()) * dirY;
+            if (along >= 0.0) return true;
+        }
+        return false;
     }
 
     private double distanceToEnd(Leg leg) {
@@ -406,6 +519,9 @@ public class FlowerRedAutoFast extends OpMode {
             return true;
         }
 
+        // Blocked anywhere on the path: no movement or turning for stallWindowSeconds.
+        if (isBlocked(leg, pose, now)) return true;
+
         // Wall stall exit: near the target but not moving means we're against the wall.
         if (leg.stallExit && dist <= STALL_EXIT_MAX_DISTANCE_IN) {
             if (stallRefPose == null) {
@@ -429,6 +545,39 @@ public class FlowerRedAutoFast extends OpMode {
         return false;
     }
 
+    /**
+     * General stall check for every leg. Measures movement and turning from a reference pose;
+     * whenever the robot moves or turns enough the reference restarts. If neither happens for
+     * stallWindowSeconds (after the grace period), the leg is over.
+     */
+    private boolean isBlocked(Leg leg, Pose pose, double now) {
+        if (!stallDetectAllPaths) return false;
+        if (now - pathStartTime < stallGraceSeconds) {
+            blockedRefPose = null;
+            return false;
+        }
+        if (blockedRefPose == null) {
+            blockedRefPose = pose;
+            blockedRefTime = now;
+            return false;
+        }
+        double moved = Math.hypot(pose.x() - blockedRefPose.x(), pose.y() - blockedRefPose.y());
+        double turned = Math.abs(angleDiffDeg(Math.toDegrees(pose.heading()),
+                Math.toDegrees(blockedRefPose.heading())));
+        if (moved > stallMinMoveIn || turned > stallMinTurnDeg) {
+            blockedRefPose = pose;
+            blockedRefTime = now;
+            return false;
+        }
+        if (now - blockedRefTime >= stallWindowSeconds) {
+            blockedCount++;
+            lastBlockedPath = String.format("%s at %.1fs, %.1f in from end",
+                    leg.name, now - pathStartTime, distanceToEnd(leg));
+            return true;
+        }
+        return false;
+    }
+
     private double angleDiffDeg(double a, double b) {
         double d = (a - b) % 360.0;
         if (d > 180.0) d -= 360.0;
@@ -446,13 +595,39 @@ public class FlowerRedAutoFast extends OpMode {
         follower.stop();
     }
 
+
+    // ---------------------------------------------------------------------------------------
+    // Alliance. The field plays exactly the same from either side, so the blue auto is this
+    // class run in the same (red) coordinates with the same presets and timings. Only the
+    // stored alliance, the Limelight tag set change. The blue Driver Station
+    // entry is a tiny subclass that overrides isBlueAlliance().
+    // ---------------------------------------------------------------------------------------
+
+    /** Overridden to true by the blue subclass. */
+    protected boolean isBlueAlliance() {
+        return false;
+    }
+
+    private void storeAlliance() {
+        if (isBlueAlliance()) PoseStorage.setBlue();
+        else PoseStorage.setRed();
+    }
+
+    private LimelightCam.Alliance aimAlliance() {
+        return isBlueAlliance() ? LimelightCam.Alliance.BLUE : LimelightCam.Alliance.RED;
+    }
+
+    private String allianceName() {
+        return isBlueAlliance() ? "BLUE" : "RED";
+    }
+
     @Override
     public void init() {
         Scheduler.reset();
         configureBulkCaching();
         clearBulkCache();
 
-        PoseStorage.setRed();
+        storeAlliance();
         PoseStorage.setPose(start);
 
         follower = Constants.create(hardwareMap);
@@ -479,22 +654,28 @@ public class FlowerRedAutoFast extends OpMode {
         robotSettings.block();
         flower.flowerActivate(RobotConstants.flowerLiftPos);
 
-        setFixedTurretPosition(PRELOAD_TURRET_POSITION);
-
         resetRuntimeState();
-        setTravelTurretPosition();
+        // Turret starts at the first shot's position (27 Nov 2026), not the travel position
+        setPreloadTurretPosition();
+    }
+
+    /** Turret straight to the preload position, counted as already settled. */
+    private void setPreloadTurretPosition() {
+        activeTurretPosition = clamp(PRELOAD_TURRET_POSITION + AUTO_TURRET_TRIM, 0.0, 1.0);
+        turret.setFixedServoPosition(activeTurretPosition);
+        turretMoveTime = -1000.0;   // long ago: no settle wait
     }
 
     @Override
     public void init_loop() {
         clearBulkCache();
-        PoseStorage.setRed();
+        storeAlliance();
         intake.update();
 
         Pose currentPose = follower.pose();
         if (currentPose != null) PoseStorage.setPose(currentPose);
 
-        telemetry.addLine("===== FLOWER RED AUTO (FAST VERSION) =====");
+        telemetry.addLine("===== FLOWER " + allianceName() + " AUTO (FAST VERSION) =====");
         telemetry.addData("Start Pose", start);
         telemetry.addData("Flower Approach Speed", "%.2f", FLOWER_APPROACH_SPEED);
         telemetry.addData("Flower Collect Speed", "%.2f", FLOWER_COLLECT_SPEED);
@@ -508,12 +689,13 @@ public class FlowerRedAutoFast extends OpMode {
     @Override
     public void start() {
         clearBulkCache();
-        PoseStorage.setRed();
+        storeAlliance();
         follower.setPose(start);
         PoseStorage.setPose(start);
         resetRuntimeState();
+        setPreloadTurretPosition();
         stopIntakeAndBlock();
-        if (spinUpAtStart) outtake.setTargetTPS(RobotConstants.outtakeTps);
+        if (spinUpAtStart) outtake.setTargetTPS(useShotTps ? shotTps(1) : RobotConstants.outtakeTps);
         lastLoopTime = getRuntime();
         schedule(autoRoutine());
     }
@@ -536,9 +718,10 @@ public class FlowerRedAutoFast extends OpMode {
         updateVision();
         updateTurret(currentPose);
         intake.update();
-        outtake.setHoodPosition(RobotConstants.hoodPosition);
-        // Lookup table: needs a fresh distance every loop (Outtake DISTANCE_TIMEOUT_SECONDS)
-        outtake.setGoalDistance(useLutRegression ? distanceToGoalIn : Double.NaN);
+        outtake.setHoodPosition(useShotTps ? shotHood(upcomingShot()) : RobotConstants.hoodPosition);
+        // Lookup table: needs a fresh distance every loop (Outtake DISTANCE_TIMEOUT_SECONDS).
+        // Off while the per-shot speeds are in use.
+        outtake.setGoalDistance(useLutRegression && !useShotTps ? distanceToGoalIn : Double.NaN);
         outtake.update();
 
         // Throttled: building and sending ~60 telemetry lines every loop skews loop timing.
@@ -557,7 +740,7 @@ public class FlowerRedAutoFast extends OpMode {
             follower.stop();
         }
 
-        PoseStorage.setRed();
+        storeAlliance();
         if (outtake != null) outtake.stopOuttake();
         if (intake != null) intake.stopIntake();
         if (robotSettings != null) robotSettings.block();
@@ -573,6 +756,7 @@ public class FlowerRedAutoFast extends OpMode {
                 shootCycle(PRELOAD_TURRET_POSITION, PRELOAD_FEED_SECONDS),
                 followTravel(leg1()),
                 collectFlower(leg2(), FIRST_FLOWER_INTAKE_HOLD_SECONDS, Double.NaN),
+                bumpFirstFlower(),
                 reverseAndLiftFlower(),
                 followTravel(leg4()),
                 followTravelPreAim(leg5(), FAR_WALL_TURRET_POSITION),
@@ -580,6 +764,7 @@ public class FlowerRedAutoFast extends OpMode {
                 followTravel(leg6()),
                 collectFlower(leg7(), SECOND_FLOWER_INTAKE_HOLD_SECONDS,
                         SECOND_FLOWER_TURRET_POSITION),
+                bumpSecondFlower(),
                 shootCycle(SECOND_FLOWER_TURRET_POSITION, FLOWER_FEED_SECONDS),
                 parkAndLiftFlower(),
                 instant(this::finishAutoMechanisms)
@@ -602,6 +787,63 @@ public class FlowerRedAutoFast extends OpMode {
                         })
                 )
         );
+    }
+
+    /**
+     * Backs straight out along the approach line by bumpBackIn, drives back in to the pickup
+     * point, then holds the intake for bumpHoldSeconds. Repeated bumpRepeats times.
+     */
+    private Command bumpFirstFlower() {
+        return bumpFlower(point2, point2Start, bumpRepeats, "BUMP 1");
+    }
+
+    /**
+     * Same bump at the second flower. The turret has already been pre-aimed for the last shot
+     * during the intake hold, and the bump doesn't move it, so the shot starts settled.
+     */
+    private Command bumpSecondFlower() {
+        return bumpFlower(point7, point7Start, secondBumpRepeats, "BUMP 2");
+    }
+
+    /**
+     * Backs straight out from the pickup toward approachFrom by bumpBackIn, drives back in,
+     * then holds the intake. Repeated `repeats` times; 0 does nothing.
+     */
+    private Command bumpFlower(Pose pickup, Pose approachFrom, int repeatCount, String name) {
+        int repeats = Math.max(0, repeatCount);
+        if (repeats == 0) return instant(() -> { });
+
+        Pose back = bumpBackPose(pickup, approachFrom);
+        Command[] steps = new Command[repeats * 3];
+        for (int i = 0; i < repeats; i++) {
+            // Intake re-commanded every loop during both moves, not just at the start
+            steps[i * 3] = race(
+                    followLeg(new Leg(pickup, back, bumpSpeed, false, false,
+                            bumpTimeoutSeconds, name + " BACK"), this::holdFlowerCollection),
+                    infinite(this::holdFlowerCollection)
+            );
+            steps[i * 3 + 1] = race(
+                    followLeg(new Leg(back, pickup, bumpSpeed, false, false,
+                            bumpTimeoutSeconds, name + " IN"), this::holdFlowerCollection),
+                    infinite(this::holdFlowerCollection)
+            );
+            steps[i * 3 + 2] = race(
+                    waitSeconds(bumpHoldSeconds),
+                    infinite(this::holdFlowerCollection)
+            );
+        }
+        return sequential(steps);
+    }
+
+    /** Pickup point moved back toward where the robot came from (approachFrom). */
+    private Pose bumpBackPose(Pose pickup, Pose approachFrom) {
+        double dx = approachFrom.x() - pickup.x();
+        double dy = approachFrom.y() - pickup.y();
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) return pickup;
+        double back = Math.max(0.0, bumpBackIn);
+        return new Pose(pickup.x() + dx / len * back, pickup.y() + dy / len * back,
+                pickup.heading());
     }
 
     private void holdFlowerCollection() {
@@ -682,10 +924,13 @@ public class FlowerRedAutoFast extends OpMode {
         } else {
             setFixedTurretPosition(turretPosition);
         }
-        outtake.setTargetTPS(RobotConstants.outtakeTps);
+        outtake.setTargetTPS(useShotTps ? shotTps(shotCount) : RobotConstants.outtakeTps);
+        activeReadyTimeoutSeconds = shotCount == 1
+                ? preloadReadyTimeoutSeconds : SHOOT_READY_TIMEOUT_SECONDS;
         startShooterReadyWait();
         stopIntakeAndBlock();
         shootStartTime = getRuntime();
+        shooterFirstReadyTime = -1.0;
         shootFeedSeconds = feedSeconds;
         shootPhase = ShootPhase.WAIT;
         visionLocked = false;
@@ -701,8 +946,14 @@ public class FlowerRedAutoFast extends OpMode {
     private void runShotStateMachine() {
         double now = getRuntime();
 
+        // Keep the stable-band clock running from the start of the shot, so the settle time
+        // overlaps with the turret and gate where it can
+        if (shootPhase != ShootPhase.DONE) shooterSpooled(now);
+
         if (shootPhase == ShootPhase.WAIT) {
-            boolean turretSettled = now - turretMoveTime >= TURRET_SETTLE_SECONDS
+            boolean settleDone = (firstShotSkipSettle && shotCount == 1)
+                    || now - turretMoveTime >= TURRET_SETTLE_SECONDS;
+            boolean turretSettled = settleDone
                     && (poseAimThisShot ? poseAimDone(now) : visionAimDone(now));
             if (turretSettled
                     && (isShooterAtFraction(PRE_RELEASE_TPS_FRACTION)
@@ -714,7 +965,7 @@ public class FlowerRedAutoFast extends OpMode {
 
         if (shootPhase == ShootPhase.RELEASE
                 && now - releaseStartTime >= BLOCK_RELEASE_SECONDS
-                && shooterReadyOrTimedOut()) {
+                && shooterSpooled(now)) {
             shootPhase = ShootPhase.FEED;
             feedStartTime = now;
             freezeVisionAim();
@@ -723,6 +974,8 @@ public class FlowerRedAutoFast extends OpMode {
         if (shootPhase == ShootPhase.FEED && now - feedStartTime >= shootFeedSeconds) {
             shootPhase = ShootPhase.DONE;
             stopIntakeAndBlock();
+            // Head straight for the next shot's speed while driving there
+            if (useShotTps) outtake.setTargetTPS(shotTps(shotCount + 1));
             return;
         }
 
@@ -765,15 +1018,63 @@ public class FlowerRedAutoFast extends OpMode {
         robotSettings.block();
     }
 
+    /** The shot being taken now, or the next one if between shots (1-based). */
+    private int upcomingShot() {
+        return shootPhase == ShootPhase.DONE ? shotCount + 1 : shotCount;
+    }
+
+    /** Flywheel speed for shot n (1 = preload, 2 = far wall, 3 = second flower). */
+    private double shotTps(int n) {
+        switch (n) {
+            case 1: return shot1Tps;
+            case 2: return shot2Tps;
+            case 3: return shot3Tps;
+            default: return RobotConstants.outtakeTps;
+        }
+    }
+
+    /** Hood for shot n; NaN in the setting means RobotConstants.hoodPosition. */
+    private double shotHood(int n) {
+        double hood = n == 1 ? shot1Hood : n == 2 ? shot2Hood : n == 3 ? shot3Hood : Double.NaN;
+        return Double.isFinite(hood) ? hood : RobotConstants.hoodPosition;
+    }
+
     private void startShooterReadyWait() {
         shooterReadyStartTime = getRuntime();
         shooterReadyTimeoutFired = false;
     }
 
+    /**
+     * True once the shooter has stayed inside the stable band (target +/- shooterStableBand-
+     * Fraction) for spoolUpExtraSeconds without leaving it. Overspeed counts as NOT stable,
+     * so a flywheel still overshooting after spin-up waits instead of firing long. If it never
+     * settles, the ready timeout fires the shot anyway so the auto can't stall.
+     */
+    private boolean shooterSpooled(double now) {
+        if (shooterInStableBand()) {
+            if (shooterFirstReadyTime < 0.0) shooterFirstReadyTime = now;
+            if (now - shooterFirstReadyTime >= Math.max(0.0, spoolUpExtraSeconds)) return true;
+        } else {
+            shooterFirstReadyTime = -1.0;
+        }
+        if (now - shooterReadyStartTime >= activeReadyTimeoutSeconds) {
+            shooterReadyTimeoutFired = true;
+            return true;
+        }
+        return false;
+    }
+
+    private boolean shooterInStableBand() {
+        double targetTPS = outtake.getTargetTPS();
+        if (targetTPS <= 0.0) return false;
+        double band = targetTPS * Math.max(0.0, shooterStableBandFraction);
+        return Math.abs(outtake.getCurrentTPS() - targetTPS) <= band;
+    }
+
     private boolean shooterReadyOrTimedOut() {
         if (isShooterAtSpeed()) return true;
 
-        if (getRuntime() - shooterReadyStartTime >= SHOOT_READY_TIMEOUT_SECONDS) {
+        if (getRuntime() - shooterReadyStartTime >= activeReadyTimeoutSeconds) {
             shooterReadyTimeoutFired = true;
             return true;
         }
@@ -855,7 +1156,7 @@ public class FlowerRedAutoFast extends OpMode {
         }
         try {
             limelightCam.update();
-            LimelightCam.HiveDetection d = limelightCam.getAimDetection(LimelightCam.Alliance.RED);
+            LimelightCam.HiveDetection d = limelightCam.getAimDetection(aimAlliance());
             if (d != null) turret.setVisionMeasurement(true, d.bearing, limelightCam.getFrameId());
             else turret.clearVisionMeasurement();
         } catch (RuntimeException e) {
@@ -1022,6 +1323,10 @@ public class FlowerRedAutoFast extends OpMode {
         currentPathTimedOut = false;
         lastTimedOutPath = "NONE";
         lastStallExitPath = "NONE";
+        lastBlockedPath = "NONE";
+        blockedCount = 0;
+        blockedRefPose = null;
+        blockedRefTime = 0.0;
         pathStartTime = 0.0;
         stallRefPose = null;
         stallRefTime = 0.0;
@@ -1046,7 +1351,7 @@ public class FlowerRedAutoFast extends OpMode {
     }
 
     private void displayTelemetry(Pose currentPose) {
-        telemetry.addLine("===== FLOWER RED AUTO (FAST VERSION) =====");
+        telemetry.addLine("===== FLOWER " + allianceName() + " AUTO (FAST VERSION) =====");
 
         if (currentPose != null) {
             telemetry.addData(
@@ -1070,6 +1375,7 @@ public class FlowerRedAutoFast extends OpMode {
         telemetry.addData("Any Timeout", anyPathTimeoutFired);
         telemetry.addData("Last Timeout", lastTimedOutPath);
         telemetry.addData("Last Stall Exit", lastStallExitPath);
+        telemetry.addData("Blocked", "%d | last: %s", blockedCount, lastBlockedPath);
         telemetry.addData("Last Pass-Through", lastPassThroughPath);
         telemetry.addData("Current Path Timed Out", currentPathTimedOut);
 
@@ -1118,13 +1424,22 @@ public class FlowerRedAutoFast extends OpMode {
                 outtake.getCurrentTPS(),
                 outtake.getTargetTPS()
         );
-        telemetry.addData("Regression", "%s (%s)",
-                outtake.isUsingDistanceRegression() ? "LUT" : "FIXED TPS",
-                outtake.getRegressionStatus());
+        telemetry.addData("Regression", useShotTps
+                ? String.format("PER-SHOT TPS: shot %d -> %.0f (hood %.3f)",
+                upcomingShot(), shotTps(upcomingShot()), shotHood(upcomingShot()))
+                : String.format("%s (%s)", outtake.isUsingDistanceRegression() ? "LUT" : "FIXED TPS",
+                outtake.getRegressionStatus()));
         telemetry.addData("Shooter Ready", isShooterAtSpeed());
         telemetry.addData("Ready Timeout", shooterReadyTimeoutFired);
+        telemetry.addData("Spool", shooterFirstReadyTime < 0.0
+                ? String.format("not stable (%.0f / %.0f, band +/-%.0f%%)",
+                outtake.getCurrentTPS(), outtake.getTargetTPS(), shooterStableBandFraction * 100.0)
+                : String.format("stable %.2f s (need %.2f)",
+                getRuntime() - shooterFirstReadyTime, spoolUpExtraSeconds));
         // Feeder is open loop now (no encoder), so show its power, not TPS
         telemetry.addData("Feeder Power", "%.2f", outtake.getFeederCommandedPower());
+        telemetry.addData("Feed Link", "scale %.2f | %.0f TPS",
+                outtake.getFeedLinkScale(), outtake.getFeedLinkTPS());
         telemetry.addData("Hood Base", "%.3f", outtake.getHoodBase());
         telemetry.addData("Hood Compensation", "%.4f", outtake.getHoodCompensation());
         telemetry.addData("Hood Command", "%.3f", outtake.getHoodPosition());

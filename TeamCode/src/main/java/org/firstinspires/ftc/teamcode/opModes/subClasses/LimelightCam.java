@@ -105,7 +105,7 @@ public class LimelightCam {
     public static String aimCellSide = "FAR";
 
     /** Minimum member tags visible before the cluster is used for aiming. */
-    public static int aimMinTags = 1;
+    public static int aimMinTags = 2;   // was 1: one tag alone can't locate the cluster centre
 
     // ---------------------------------------------------------------------
     // Diagnostics for telemetry
@@ -554,6 +554,37 @@ public class LimelightCam {
                 pitch, roll, yaw, f.getTargetArea(), hasPose);
     }
 
+    /**
+     * Bearing to the CENTRE of the cluster, even when only some of its four
+     * tags are visible. The tags sit in a row in ID order (e.g. 30-31-32-33),
+     * so their bearings fall on a line against their position in the row
+     * (0-3). A straight-line fit through the visible tags gives the bearing
+     * at position 1.5, the middle. A plain average of, say, tags 30 and 31
+     * would be pulled toward that end of the cluster and aim off to one side.
+     * Works from either side of the cell (the fit finds the direction).
+     * With a single tag there's nothing to fit, so its own bearing is used.
+     */
+    private static double clusterCentreBearing(List<TagDetection> group, double average) {
+        int n = group.size();
+        if (n < 2) return average;
+
+        double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+        for (TagDetection t : group) {
+            double x = Math.floorMod(t.id - RED_FAR_TAG_MIN, TAGS_PER_CELL);  // 0-3 in the row
+            sumX += x;
+            sumY += t.bearing;
+            sumXX += x * x;
+            sumXY += x * t.bearing;
+        }
+        double denom = n * sumXX - sumX * sumX;
+        if (Math.abs(denom) < 1e-9) return average;   // same position twice (shouldn't happen)
+
+        double slope = (n * sumXY - sumX * sumY) / denom;
+        double intercept = (sumY - slope * sumX) / n;
+        double centre = intercept + slope * (TAGS_PER_CELL - 1) / 2.0;
+        return Double.isFinite(centre) ? centre : average;
+    }
+
     private static HiveDetection buildHive(HiveCell cell, List<TagDetection> group) {
         double bearingSum = 0.0;
         double rangeSum = 0.0;
@@ -569,7 +600,7 @@ public class LimelightCam {
             }
         }
 
-        double bearing = bearingSum / group.size();
+        double bearing = clusterCentreBearing(group, bearingSum / group.size());
         double range = rangeCount > 0 ? rangeSum / rangeCount : Double.NaN;
 
         // Angles from the clearest tag rather than an average, so angle

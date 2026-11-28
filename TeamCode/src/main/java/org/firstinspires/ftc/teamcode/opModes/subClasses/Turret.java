@@ -127,7 +127,7 @@ public class Turret {
     // velocityX and velocityY must be field-frame velocities in inches/s.
     // ---------------------------------------------------------------------
 
-    public static boolean velocityCompensationActive = true;
+    public static boolean velocityCompensationActive = false;
     public static double VELOCITY_LEAD_GAIN = 0.3;
 
     // ---------------------------------------------------------------------
@@ -267,6 +267,9 @@ public class Turret {
     private long lastVisionCorrectionNs = 0L;
 
     private boolean visionOnlyMode = false;
+
+    // Shoot on the move: frames are skipped (correction held) while moving fast
+    private boolean visionUpdatesAllowed = true;
 
     // Turret settle tracking (commanded angle)
     private double settleRefAngleDeg = Double.NaN;
@@ -663,13 +666,42 @@ public class Turret {
             double velocityY
     ) {
 
+        // Old simple lead: a fixed VELOCITY_LEAD_GAIN seconds of travel.
+        double leadX = 0.0;
+        double leadY = 0.0;
+
+        if (velocityCompensationActive
+                && Double.isFinite(velocityX)
+                && Double.isFinite(velocityY)
+                && Double.isFinite(VELOCITY_LEAD_GAIN)) {
+
+            leadX = -velocityX * VELOCITY_LEAD_GAIN;
+            leadY = -velocityY * VELOCITY_LEAD_GAIN;
+        }
+
+        aimTurretWithLead(robotPose, leadX, leadY);
+    }
+
+    /**
+     * Shoot on the move: aims at the goal shifted by (leadX, leadY) inches
+     * (the "virtual goal"), worked out by the caller from the robot's
+     * velocity and the ball's time of flight. The Limelight correction is
+     * still measured against the REAL goal, so the camera never pulls the
+     * aim back off the lead.
+     */
+    public void aimTurretWithLead(
+            Pose robotPose,
+            double leadX,
+            double leadY
+    ) {
+
         refreshGoalTarget();
 
         AimCalculation calculation =
                 calculateAim(
                         robotPose,
-                        velocityX,
-                        velocityY
+                        Double.isFinite(leadX) ? leadX : 0.0,
+                        Double.isFinite(leadY) ? leadY : 0.0
                 );
 
         if (calculation == null) {
@@ -684,7 +716,7 @@ public class Turret {
         double correctionRad =
                 Math.toRadians(
                         updateVisionCorrection(
-                                calculation.requestedAngleRad
+                                calculation.realRequestedAngleRad
                         )
                 );
 
@@ -699,20 +731,14 @@ public class Turret {
         );
     }
 
-    public void ShootOnTheMove(double RobotX, double RobotY, double RobotHeading, double VelocityX, double VelocityY) {
-        Pose robotPose = new Pose(RobotX, RobotY, RobotHeading);
-        aimTurret(robotPose, VelocityX, VelocityY);
-
-    }
-
     // ---------------------------------------------------------------------
     // Field-coordinate aim calculation
     // ---------------------------------------------------------------------
 
     private AimCalculation calculateAim(
             Pose robotPose,
-            double velocityX,
-            double velocityY
+            double leadX,
+            double leadY
     ) {
 
         if (!validPose(robotPose)
@@ -777,25 +803,8 @@ public class Turret {
         }
 
         /*
-         * Optional movement compensation.
+         * Movement compensation: aim at the goal shifted by the lead.
          */
-        double leadX = 0.0;
-        double leadY = 0.0;
-
-        if (velocityCompensationActive
-                && Double.isFinite(velocityX)
-                && Double.isFinite(velocityY)
-                && Double.isFinite(VELOCITY_LEAD_GAIN)) {
-
-            leadX =
-                    -velocityX
-                            * VELOCITY_LEAD_GAIN;
-
-            leadY =
-                    -velocityY
-                            * VELOCITY_LEAD_GAIN;
-        }
-
         double aimDx =
                 targetDx
                         + leadX;
@@ -845,8 +854,18 @@ public class Turret {
             return null;
         }
 
+        // Same angle to the REAL goal (no lead), for the Limelight correction
+        double realRequestedAngle =
+                normalizeRadians(
+                        Math.atan2(targetDy, targetDx)
+                                - heading
+                                - Math.toRadians(TURRET_ZERO_OFFSET_DEG)
+                                + Math.toRadians(activeAngleTrimDeg())
+                );
+
         return new AimCalculation(
                 requestedAngle,
+                realRequestedAngle,
                 fieldTargetAngle,
                 pivotX,
                 pivotY,
@@ -1350,6 +1369,16 @@ public class Turret {
         setVisionMeasurement(false, Double.NaN, visionFrameId);
     }
 
+    /**
+     * Shoot on the move: false stops new Limelight frames from updating the
+     * correction (frames taken while moving fast are blurred and late). The
+     * current correction is kept.
+     */
+    public void setVisionUpdatesAllowed(boolean allowed) {
+
+        visionUpdatesAllowed = allowed;
+    }
+
     /** Drops the vision correction (pose reset, goal change). */
     public void clearVisionCorrection() {
 
@@ -1360,6 +1389,18 @@ public class Turret {
 
         lastVisionCorrectionDeg = 0.0;
         lastVisionMeasuredDeg = Double.NaN;
+    }
+
+    /**
+     * Where the turret should point relative to the camera's view of the goal:
+     * the camera mounting offset PLUS the goal's angle trim. Before 27 Nov
+     * 2026 the trim was left out here, so as soon as the Limelight locked on
+     * it cancelled HIGH/LOW_GOAL_ANGLE_TRIM_DEG and the aim moved back by
+     * the trim. The trim now applies the same with or without the camera.
+     */
+    private double visionAimOffsetDeg() {
+
+        return finiteOr(cameraYawOffsetDeg, 0.0) + activeAngleTrimDeg();
     }
 
     /** True if the camera can currently see the goal cluster. */
@@ -1390,6 +1431,13 @@ public class Turret {
         long now = System.nanoTime();
 
         if (visionSeen
+                && visionFrameId != lastUsedVisionFrameId
+                && !visionUpdatesAllowed) {
+
+            lastVisionStatus = visionCorrectionValid
+                    ? "MOVING - HOLDING CORRECTION" : "MOVING - NOT MEASURING";
+
+        } else if (visionSeen
                 && visionFrameId != lastUsedVisionFrameId) {
 
             if (!isTurretSettled()) {
@@ -1406,7 +1454,7 @@ public class Turret {
                 double visionWantsDeg =
                         lastFinalAngleDeg
                                 + visionBearingDeg
-                                + finiteOr(cameraYawOffsetDeg, 0.0);
+                                + visionAimOffsetDeg();
 
                 double measured =
                         normalizeDegrees180(visionWantsDeg - odometryDeg);
@@ -1512,7 +1560,7 @@ public class Turret {
 
             double gain = clamp(finiteOr(visionOnlyGain, 0.7), 0.0, 1.0);
             angleDeg = lastFinalAngleDeg
-                    + gain * (visionBearingDeg + finiteOr(cameraYawOffsetDeg, 0.0));
+                    + gain * (visionBearingDeg + visionAimOffsetDeg());
 
             lastVisionStatus = "VISION ONLY: TRACKING";
 
@@ -1564,7 +1612,7 @@ public class Turret {
 
         return visionSeen
                 && isTurretSettled()
-                && Math.abs(visionBearingDeg + finiteOr(cameraYawOffsetDeg, 0.0))
+                && Math.abs(visionBearingDeg + visionAimOffsetDeg())
                 <= Math.abs(finiteOr(visionOnTargetDeg, 2.0));
     }
 
@@ -1598,6 +1646,7 @@ public class Turret {
     private static class AimCalculation {
 
         final double requestedAngleRad;
+        final double realRequestedAngleRad;
         final double fieldTargetAngleRad;
 
         final double pivotX;
@@ -1610,6 +1659,7 @@ public class Turret {
 
         AimCalculation(
                 double requestedAngleRad,
+                double realRequestedAngleRad,
                 double fieldTargetAngleRad,
                 double pivotX,
                 double pivotY,
@@ -1620,6 +1670,9 @@ public class Turret {
 
             this.requestedAngleRad =
                     requestedAngleRad;
+
+            this.realRequestedAngleRad =
+                    realRequestedAngleRad;
 
             this.fieldTargetAngleRad =
                     fieldTargetAngleRad;
